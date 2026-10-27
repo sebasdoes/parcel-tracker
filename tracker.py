@@ -29,7 +29,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 
-DATA_DIR   = os.environ.get("DATA_DIR", "/data")
+SAMPLE_MODE = "--sample" in sys.argv or os.environ.get("SAMPLE") == "1"
+
+# In sample mode (host runs, CI) /data usually doesn't exist — fall back to
+# a local dir unless DATA_DIR is set explicitly. Order matters: SAMPLE first.
+DATA_DIR   = os.environ.get("DATA_DIR", (".data" if SAMPLE_MODE else "/data"))
 DOMAIN     = os.environ.get("VINTED_DOMAIN", "www.vinted.nl")
 BASE       = "https://" + DOMAIN
 POLL_S     = int(os.environ.get("POLL_SECONDS", "900"))
@@ -40,8 +44,6 @@ DB_PATH    = os.path.join(DATA_DIR, "tracker.db")
 COOKIES    = os.path.join(DATA_DIR, "cookies.json")
 STATEFILE  = os.path.join(DATA_DIR, "snapshot.json")
 LOGPATH    = os.path.join(DATA_DIR, "poll.log")
-
-SAMPLE_MODE = "--sample" in sys.argv or os.environ.get("SAMPLE") == "1"
 
 # ------------------------- storage -------------------------
 

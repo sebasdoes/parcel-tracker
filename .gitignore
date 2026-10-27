@@ -7,3 +7,5 @@ txraw_last.json
 
 __pycache__/
 *.pyc
+# sample-mode host runs write here (DATA_DIR default in sample mode)
+.data/
