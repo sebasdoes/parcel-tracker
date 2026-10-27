@@ -3,7 +3,7 @@
 # LAN-only by design: the site is for the household, the poller needs no TLS.
 services:
   vinted-tracker:
-    image: ghcr.io/sebasdoes/vinted-parcel-tracker:latest   # or build: .
+    image: ghcr.io/sebasdoes/parcel-tracker:latest   # or build: .
     container_name: vinted-tracker
     restart: unless-stopped
     ports:

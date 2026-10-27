@@ -49,7 +49,7 @@ restart.
 ```yaml
 services:
   vinted-tracker:
-    image: ghcr.io/sebasdoes/vinted-parcel-tracker:latest
+    image: ghcr.io/sebasdoes/parcel-tracker:latest
     container_name: vinted-tracker
     restart: unless-stopped
     ports:
