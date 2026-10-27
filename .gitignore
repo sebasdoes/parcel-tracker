@@ -1,0 +1,9 @@
+# data volume contents (never commit cookies!)
+data/
+*.db
+snapshot.json
+poll.log
+txraw_last.json
+
+__pycache__/
+*.pyc

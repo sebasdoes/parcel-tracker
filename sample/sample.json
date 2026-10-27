@@ -1,0 +1,40 @@
+{
+  "transactions": [
+    {
+      "id": 100200300,
+      "state": "picked_up_wait_for_receiver",
+      "created_at": "2026-10-27T09:12:00+01:00",
+      "updated_at": "2026-10-28T07:40:00+01:00",
+      "pick_up_point": { "name": "Albert Heijn", "address": "Stadshart 12", "city": "Amstelveen" },
+      "shipping_option": { "type": "pickup_point" },
+      "item": {
+        "id": 42,
+        "title": "Vintage denim jacket",
+        "price": "25.00",
+        "photo": { "data": [{ "url": "sample-1.jpg" }] }
+      },
+      "parcel": { "carrier": "DPD", "pickup_expires_at": "2026-11-04T21:00:00+01:00" },
+      "buyer": { "id": 7, "login": "sebasdoes" },
+      "seller": { "id": 33, "login": "someshop" }
+    },
+    {
+      "id": 100200301,
+      "state": "in_transit",
+      "created_at": "2026-10-28T11:02:00+01:00",
+      "updated_at": "2026-10-28T11:02:00+01:00",
+      "shipping_option": { "type": "delivery", "carrier": "PostNL" },
+      "item": { "id": 43, "title": "Studio Ghibli artbook", "price": "40.00" },
+      "buyer": { "id": 7, "login": "sebasdoes" },
+      "seller": { "id": 51, "login": "bookfan" }
+    },
+    {
+      "id": 100200302,
+      "state": "received",
+      "created_at": "2026-10-20T15:00:00+01:00",
+      "updated_at": "2026-10-22T18:30:00+01:00",
+      "item": { "id": 44, "title": "Mechanical keyboard switches (x70)", "price": "12.50" },
+      "buyer": { "id": 7, "login": "sebasdoes" },
+      "seller": { "id": 88, "login": "keycapqueen" }
+    }
+  ]
+}

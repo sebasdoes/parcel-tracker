@@ -1,0 +1,18 @@
+# docker1 service block (podman compose, CoreOS)
+# Put me in /srv/<name>/compose (or however the docker1 stack is laid out) — I publish
+# LAN-only by design: the site is for the household, the poller needs no TLS.
+services:
+  vinted-tracker:
+    image: ghcr.io/sebasdoes/vinted-parcel-tracker:latest   # or build: .
+    container_name: vinted-tracker
+    restart: unless-stopped
+    ports:
+      - "8085:8080"          # LAN only — no reverse proxy needed; the data is behind the LAN
+    environment:
+      - USER_AGENT=${USER_AGENT}          # REQUIRED: exact UA of the browser the cookies came from
+      - POLL_SECONDS=900                  # 15 min
+      - VINTED_DOMAIN=www.vinted.nl       # cookie domain matters
+      # - WEBHOOK_URL=...                # optional change-broadcast (ntfy/matrix/... generic POST)
+    volumes:
+      - ./data:/data:Z                    # cookies.json + SQLite + snapshot live here
+    # SELinux: CoreOS podman needs :Z on bind mounts
