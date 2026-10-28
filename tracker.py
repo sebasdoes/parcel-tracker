@@ -424,7 +424,7 @@ def fetch_state(acct):
         oid = t.get("order_id")
         if not oid or not oid.isdigit():
             continue
-        hosts = [host_cache] if host_cache else [f"https://api.{api_host}", base]
+        hosts = [host_cache] if host_cache else [base, f"https://api.{api_host}"]   # journey lives on www (verified)
         for host in hosts:
             jcode, jbody = api_get(f"/api/v2/transactions/{oid}/shipment/journey_summary", host, ua, cookie_raw,
                                    referer=f"{base}/my_orders?order_type=purchased")
@@ -457,23 +457,33 @@ def _flatten_pickup_dicts(node, t, depth=0):
             _flatten_pickup_dicts(x, t, depth + 1)
 
 def merge_journey(t, jbody):
-    """Fold a journey_summary payload into a parsed order row (generic, shape-unverified)."""
-    details = walk_json(jbody)
-    for p, k, v in details:
-        if DEADLINE_KEY_RE.search(k) and not t.get("deadline"):
-            t["deadline"] = f"{k}: {v}"
-        elif PICKUP_HINT_RE.search(k) and isinstance(v, str) and len(v) < 120:
-            t["pickup"].setdefault(k, v)
-    # dict-valued pickup hints (walk only surfaces scalars) — recurse the payload
-    _flatten_pickup_dicts(jbody, t)
-    # explicit state/status keys the summary may carry
-    jst = jbody.get("status") or jbody.get("state") or ""
-    if jst and not t.get("state"):
-        t["state"] = jst
-    shipment = jbody.get("shipment") if isinstance(jbody.get("shipment"), dict) else {}
-    carrier = jbody.get("carrier") or shipment.get("carrier")
-    if carrier:
-        t["pickup"].setdefault("carrier", carrier if isinstance(carrier, str) else str(carrier))
+    """journey_summary (verified 2026-10-28): {"journey_summary": {details[], carriers[],
+    estimated_detail{time_period,status}, current_carrier{...tracking_url}, status}}."""
+    j = jbody.get("journey_summary") if isinstance(jbody, dict) else None
+    if not isinstance(j, dict):
+        return                                     # unknown shape; leave the row as-is
+    jst = j.get("status")
+    if jst:
+        t["state"] = jst                           # parcel-flow state beats the buyer-flow "waiting"
+    cc = j.get("current_carrier") or {}
+    if cc.get("tracking_url"):
+        t["track"] = cc["tracking_url"]
+    details = j.get("details") or []
+    last = details[-1] if details and isinstance(details[-1], dict) else {}
+    if last.get("message"):
+        t["pickup"]["last"] = str(last["message"])[:90]
+    est = j.get("estimated_detail") or {}
+    if est.get("time_period") and not t.get("deadline"):
+        t["deadline"] = f"{est.get('status') or 'ETA'}: {est['time_period']}"
+    for d in details:
+        di = d.get("delivery_information")
+        if isinstance(di, dict):
+            _flatten_pickup_dicts(di, t)           # pickup point dicts if Vinted put them there
+            for p, k, v in walk_json(di):
+                if DEADLINE_KEY_RE.search(k) and not t.get("deadline"):
+                    t["deadline"] = f"{k}: {v}"
+                elif PICKUP_HINT_RE.search(k) and isinstance(v, str) and len(v) < 120:
+                    t["pickup"].setdefault(k, v)
 
 def fetch_vinted(acct) -> list:
     if SAMPLE_MODE:
