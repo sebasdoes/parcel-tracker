@@ -1,0 +1,45 @@
+[
+  {
+    "source": "postnl",
+    "order_id": "3SBABA0001234561",
+    "role": "in",
+    "title": "AliExpress bestelling",
+    "state": "Ligt klaar bij de PostNL-punt",
+    "updated_at": "2026-10-27T09:00:00+02:00",
+    "pickup": {"type": "ServicePoint"},
+    "deadline": "2026-10-29T23:59:00+01:00",
+    "track": "https://jouw.postnl.nl/track-and-trace/3SBABA0001234561",
+    "raw": {"barcode": "3SBABA0001234561", "shipmentType": "Parcel", "delivered": 0,
+            "deliveryAddressType": "ServicePoint", "title": " AliExpress bestelling",
+            "deliveryWindowFrom": null, "deliveryWindowTo": null}
+  },
+  {
+    "source": "postnl",
+    "order_id": "3SBABA0007891012",
+    "role": "in",
+    "title": "Bol.com bestelling",
+    "state": "Onderweg naar huis",
+    "updated_at": "2026-10-27T07:30:00+02:00",
+    "pickup": {},
+    "deadline": "2026-10-28T22:30:00+01:00",
+    "track": "https://jouw.postnl.nl/track-and-trace/3SBABA0007891012",
+    "raw": {"barcode": "3SBABA0007891012", "shipmentType": "Parcel", "delivered": 0,
+            "deliveryAddressType": "HomeAddress", "title": "Bol.com bestelling",
+            "deliveryWindowFrom": "2026-10-28T18:00:00+01:00",
+            "deliveryWindowTo": "2026-10-28T22:30:00+01:00"}
+  },
+  {
+    "source": "postnl",
+    "order_id": "3SBABA0001314151",
+    "role": "out",
+    "title": "Return Shipment",
+    "state": "Pakket is bezorgd",
+    "updated_at": "2026-10-25T15:44:00+02:00",
+    "pickup": {},
+    "deadline": "2026-10-25T15:44:00+02:00",
+    "track": "https://jouw.postnl.nl/track-and-trace/3SBABA0001314151",
+    "raw": {"barcode": "3SBABA0001314151", "shipmentType": "ReturnParcel", "delivered": 1,
+            "deliveredTimeStamp": "2026-10-25T15:44:00+02:00",
+            "title": "Return Shipment"}
+  }
+]

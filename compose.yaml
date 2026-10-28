@@ -9,7 +9,9 @@ services:
     ports:
       - "8085:8080"          # LAN only — no reverse proxy needed; the data is behind the LAN
     environment:
-      - USER_AGENT=${USER_AGENT}          # REQUIRED: exact UA of the browser the cookies came from
+      - USER_AGENT=${USER_AGENT}          # vinted: REQUIRED if cookies.json present
+      - POSTNL_EMAIL=${POSTNL_EMAIL}      # postnl source: leave empty to disable
+      - POSTNL_PASSWORD=${POSTNL_PASSWORD}
       - POLL_SECONDS=900                  # 15 min
       - VINTED_DOMAIN=www.vinted.nl       # cookie domain matters
       # - WEBHOOK_URL=...                # optional change-broadcast (ntfy/matrix/... generic POST)

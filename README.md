@@ -1,7 +1,9 @@
-# Vinted parcel tracker
+# Parcel tracker
 
-Small poller + dashboard for Vinted packages received via pick-up points:
-what's waiting, where, and until when. Stdlib-only Python (no browser inside),
+Small poller + dashboard for your parcels, from every source that's onboarded
+today: **Vinted** (browser-cookie session) and **PostNL** (account login,
+headless; also picks up AliExpress parcels riding the NL PostNL leg).
+What's waiting, where, and until when. Stdlib-only Python (no browser inside),
 ~25 MB alpine image, single SQLite file, optional change webhook.
 
 Inspired by the bambu-downloader pattern: poll → store → show.
@@ -65,6 +67,31 @@ services:
 `echo 'USER_AGENT=Mozilla/5.0 ...' > .env` next to the compose file, then
 `docker compose up -d`. Dashboard: `http://docker1.lan:8085/`.
 
+### 2b. PostNL source (optional — add to the same compose)
+
+```yaml
+    environment:
+      - POSTNL_EMAIL=${POSTNL_EMAIL}        # jouw.postnl.nl / app email
+      - POSTNL_PASSWORD=${POSTNL_PASSWORD}
+```
+
+Headless login (PKCE flow against login.postnl.nl, same as the community HA
+integration), tokens auto-refreshed and stored in `data/postnl_token.json`;
+password is used only when both refresh and login-retry are needed. Pulls all
+incoming **and** outgoing shipments for the account — no tracking codes to
+paste. A bonus: AliExpress parcels whose NL leg travels via PostNL show up
+here automatically.
+
+**Not onboarded (yet): AliExpress order auto-discovery.** AliExpress signs
+every API call (mtop) and some endpoints demand extra anti-bot tokens —
+brittle by design. Parked until there's time to babysit that integration;
+Cainiao tracking-by-number works anonymously if we ever want the manual path.
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `PostNL rejected credentials` in poll.log | wrong email/password | fix the env values |
+| postnl ⚠ transient error | login hiccup (recaptcha/rate limit) or API blip | retries next poll — persistent failures: check container logs |
+
 ### 3. First-run endpoint discovery
 
 The first successful poll writes the **raw API response** to
@@ -87,6 +114,7 @@ transaction-state change — point it at ntfy/matrix/anything.
 
 ## What is stored
 
-- `tracker.db` — `transactions` (latest state per order, raw payload preserved) + `events` (state changes, appended)
-- `snapshot.json` — latest normalized overview (what Hermes reads)
+- `tracker.db` — `transactions` (latest state per order, normalized dict preserved) + `events` (state changes, appended)
+- `snapshot.json` — latest normalized overview + per-source health (what Hermes reads)
+- `postnl_token.json` — PostNL access/refresh tokens (created when the PostNL source is on)
 - Nothing leaves the box except the optional webhook you configure.

@@ -1,7 +1,7 @@
 FROM python:3.12-alpine
 
 WORKDIR /app
-COPY tracker.py .
+COPY tracker.py postnl.py ./
 COPY sample/ sample/
 COPY tests/ tests/
 

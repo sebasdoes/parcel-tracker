@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax
-        run: python3 -m py_compile tracker.py tests/smoke_test.py
+        run: python3 -m py_compile tracker.py postnl.py tests/smoke_test.py
       - name: Sample-mode smoke test
         run: python3 tests/smoke_test.py
 
@@ -31,7 +31,7 @@ jobs:
           docker run -d --rm --name vt-serve -e SAMPLE=1 -p 8080:8080 vinted-tracker:test
           sleep 5
           curl -sf http://127.0.0.1:8080/healthz | grep -q '"ok": true'
-          curl -sf http://127.0.0.1:8080/api/overview.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert len(d["transactions"]) == 3, "expected 3 sample transactions"'
+          curl -sf http://127.0.0.1:8080/api/overview.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert {t["source"] for t in d["transactions"]} == {"vinted","postnl"}, "expected both sources"'
           curl -sf http://127.0.0.1:8080/ | grep -q "Awaiting pick-up"
           docker stop vt-serve
 

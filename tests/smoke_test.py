@@ -3,6 +3,7 @@
 
 Starts the server as a real child process (Popen), probes the HTTP endpoints,
 then shuts it down. tracker.py --sample serves on :8080 in the foreground.
+Sample data covers both sources (vinted + postnl).
 """
 import json, subprocess, sys, time, urllib.request
 
@@ -45,14 +46,20 @@ try:
         try:
             p = get("/")
             html = p.read().decode()
-            checks.append(("/ ok", p.status == 200 and "Vinted parcels" in html))
+            checks.append(("/ ok", p.status == 200 and "Parcels" in html
+                           and "Awaiting pick-up" in html))
         except Exception as e:
             checks.append(("/ ok", False))
             notes.append(f"/: {e}")
         try:
             j = get("/api/overview.json")
             d = json.loads(j.read().decode())
-            checks.append(("/api/overview.json ok", j.status == 200 and len(d["transactions"]) == 3))
+            srcs = [t.get("source") for t in d["transactions"]]
+            checks.append(("/api/overview.json ok",
+                           j.status == 200
+                           and srcs.count("vinted") == 3
+                           and srcs.count("postnl") == 3
+                           and set(d.get("sources", {})) == {"vinted", "postnl"}))
         except Exception as e:
             checks.append(("/api/overview.json ok", False))
             notes.append(f"/api/overview.json: {e}")
