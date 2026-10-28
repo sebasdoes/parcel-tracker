@@ -1,0 +1,29 @@
+# Parcel tracker — podman quadlet for the CoreOS nodes (docker1 etc).
+# Complements (replaces) deploy/../../compose.yaml: same image, same LAN-only port.
+#
+# Configuration lives ONLY in the data volume: /var/containerdata/parcel-tracker/
+#   - config.json      — accounts (vinted/postnl lists), poll cadence, webhook  (see config.example.json)
+#   - cookies*.json    — per-vinted-account cookie files
+#   - postnl_token_*.json, tracker.db, snapshot.json, poll.log — created at runtime
+# config.json is hot-reloaded (mtime): account/cadence edits need no restart.
+[Unit]
+Description=Parcel tracker (Vinted + PostNL poller, LAN dashboard)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=parcel-tracker
+Image=ghcr.io/sebasdoes/parcel-tracker:latest
+AutoUpdate=registry
+Volume=/var/containerdata/parcel-tracker:/data:Z
+PublishPort=8085:8080
+Environment=TZ=Europe/Amsterdam
+
+[Service]
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=900
+StartLimitBurst=40
+
+[Install]
+WantedBy=multi-user.target

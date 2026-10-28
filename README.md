@@ -72,7 +72,14 @@ shape. `user_agent` **must** be the *exact* User-Agent of that browser
 (DevTools → Console → `navigator.userAgent`). DataDome scores cookie
 consistency against IP and UA; a mismatched UA raises challenge risk.
 
-### 3. Compose (docker1.lan)
+### 3. Install (two variants)
+
+**Quadlet (CoreOS / podman systemd) — see `deploy/parcel-tracker.container`:**
+copy that file to `/etc/containers/systemd/parcel-tracker.container` on the
+node, put `config.json` in `/var/containerdata/parcel-tracker/`, then
+`sudo systemctl daemon-reload && sudo systemctl enable --now parcel-tracker.service` below.
+
+**Compose:** keep the block below as the alternative.
 
 ```yaml
 services:
