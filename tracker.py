@@ -309,7 +309,7 @@ def order_list(payload):
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("escrow_orders", "orders", "transactions", "data"):
+        for key in ("my_orders", "escrow_orders", "orders", "transactions", "data"):
             v = payload.get(key)
             if isinstance(v, list):
                 return v
@@ -325,7 +325,8 @@ def parse_transactions(payload):
     for t in tx:
         if not isinstance(t, dict):
             continue
-        order_id = str(t.get("id") or t.get("order_id") or t.get("order_number") or "")
+        order_id = str(t.get("escrow_order_id") or t.get("id") or t.get("order_id")
+                       or t.get("order_number") or t.get("escrow_order_uuid") or "")
         if not order_id and isinstance(t.get("item"), dict):
             order_id = str(t["item"].get("id", ""))
         item = t.get("item") if isinstance(t.get("item"), dict) else {}
@@ -342,11 +343,13 @@ def parse_transactions(payload):
                     break
         shipment = t.get("shipment") if isinstance(t.get("shipment"), dict) else {}
         parcel = t.get("parcel") if isinstance(t.get("parcel"), dict) else {}
-        state = t.get("state") or t.get("status") or shipment.get("status") or parcel.get("status") or ""
+        state = (t.get("state") or t.get("status") or shipment.get("status")
+                 or parcel.get("status") or t.get("escrow_state") or t.get("status_name") or "")
         info = {"order_id": order_id,
-                "title": item.get("title") or nested_title or t.get("title") or "",
+                "title": item.get("title") or nested_title or t.get("item_title")
+                         or t.get("title") or "",
                 "state": state,
-                "updated_at": t.get("updated_at") or t.get("created_at"),
+                "updated_at": t.get("updated_at") or t.get("created_at") or t.get("date"),
                 "pickup": {}, "deadline": None, "raw": t}
         for p, k, v in details:
             if DEADLINE_KEY_RE.search(k):
