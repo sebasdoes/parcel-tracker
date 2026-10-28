@@ -343,8 +343,9 @@ def parse_transactions(payload):
                     break
         shipment = t.get("shipment") if isinstance(t.get("shipment"), dict) else {}
         parcel = t.get("parcel") if isinstance(t.get("parcel"), dict) else {}
-        state = (t.get("state") or t.get("status") or shipment.get("status")
-                 or parcel.get("status") or t.get("escrow_state") or t.get("status_name") or "")
+        state = (t.get("transaction_user_status") or t.get("state") or t.get("status")
+                 or shipment.get("status") or parcel.get("status")
+                 or t.get("escrow_state") or t.get("status_name") or "")
         info = {"order_id": order_id,
                 "title": item.get("title") or nested_title or t.get("item_title")
                          or t.get("title") or "",
@@ -414,9 +415,65 @@ def fetch_state(acct):
         return False, {"error": f"escrow-orders HTTP {code}",
                        "hint": "raw body dumped to txraw_%s.json — endpoint/auth/header mismatch" % name}
     parsed = parse_transactions(txp)
+
+    # Per-order shipment detail: /api/v2/transactions/<escrow_order_id>/shipment/journey_summary
+    # (user live-captured; host may live on api.<domain> or www — try api first, remember what works)
+    host_cache = _journey_host_cache.get(name)
     for t in parsed:
         t.setdefault("track", None)
+        oid = t.get("order_id")
+        if not oid or not oid.isdigit():
+            continue
+        hosts = [host_cache] if host_cache else [f"https://api.{api_host}", base]
+        for host in hosts:
+            jcode, jbody = api_get(f"/api/v2/transactions/{oid}/shipment/journey_summary", host, ua, cookie_raw,
+                                   referer=f"{base}/my_orders?order_type=purchased")
+            if jcode == 200 and isinstance(jbody, dict) and not jbody.get("__error__"):
+                _journey_host_cache[name] = host if not host_cache else host_cache
+                merge_journey(t, jbody)
+                break
+            if is_datadome_block(jcode, jbody):
+                break
+        # first working host sticks; wrong-host 404s only happen before the first success
     return True, {"user_id": uid, "transactions": parsed}
+
+_journey_host_cache: dict[str, str] = {}
+
+PICKUP_DICT_RE = re.compile(r'(pick[_ ]?up(_point)?|pick_up|parcel_shop|parcelshop)', re.I)
+
+def _flatten_pickup_dicts(node, t, depth=0):
+    """Flatten dict-valued pickup hints (e.g. shipment.pick_up_point) into t['pickup']."""
+    if depth > 5:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, dict) and PICKUP_DICT_RE.fullmatch(k):
+                for kk, vv in v.items():
+                    if isinstance(vv, (str, int)) and not isinstance(vv, bool) and len(str(vv)) < 120:
+                        t["pickup"].setdefault(kk, str(vv))
+            _flatten_pickup_dicts(v, t, depth + 1)
+    elif isinstance(node, list):
+        for x in node:
+            _flatten_pickup_dicts(x, t, depth + 1)
+
+def merge_journey(t, jbody):
+    """Fold a journey_summary payload into a parsed order row (generic, shape-unverified)."""
+    details = walk_json(jbody)
+    for p, k, v in details:
+        if DEADLINE_KEY_RE.search(k) and not t.get("deadline"):
+            t["deadline"] = f"{k}: {v}"
+        elif PICKUP_HINT_RE.search(k) and isinstance(v, str) and len(v) < 120:
+            t["pickup"].setdefault(k, v)
+    # dict-valued pickup hints (walk only surfaces scalars) — recurse the payload
+    _flatten_pickup_dicts(jbody, t)
+    # explicit state/status keys the summary may carry
+    jst = jbody.get("status") or jbody.get("state") or ""
+    if jst and not t.get("state"):
+        t["state"] = jst
+    shipment = jbody.get("shipment") if isinstance(jbody.get("shipment"), dict) else {}
+    carrier = jbody.get("carrier") or shipment.get("carrier")
+    if carrier:
+        t["pickup"].setdefault("carrier", carrier if isinstance(carrier, str) else str(carrier))
 
 def fetch_vinted(acct) -> list:
     if SAMPLE_MODE:
