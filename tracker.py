@@ -687,9 +687,16 @@ def p_class(state):
     return "other"
 
 def is_waiting(state, role):
+    """True only when the parcel physically waits at a pickup point.
+
+    NOT matched: pre-shipment states — vinted's transaction_user_status
+    "waiting" means waiting on the SELLER (user correction 2026-10-28), so a
+    bare "wait"/"pending" is deliberately absent; the at-collection shapes are
+    explicit (pickup phrasing, wait_for_receiver, pickup-point, Dutch 'klaar')."""
     s = (state or "").lower()
     return role == "in" and s and any(x in s for x in
-        ("pick up", "pickup", "pick-up", "ready to", "wait", "pending", "klaar"))
+        ("pick up", "pickup", "pick-up", "punt", "point", "ready to",
+         "wait_for_receiver", "at_pickup", "klaar"))
 
 def store_row(info):
     """JSON for the transactions.data column — the normalized dict itself."""
