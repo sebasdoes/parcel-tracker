@@ -262,10 +262,10 @@ BROWSER_HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
-def api_get(path, base, ua, cookie_raw=None):
+def api_get(path, base, ua, cookie_raw=None, referer=None):
     url = f"{base}{path}"
     headers = {"user-agent": ua or "Mozilla/5.0",
-               "referer": f"{base}/",
+               "referer": referer or f"{base}/",
                "x-requested-with": "XMLHttpRequest"}
     if cookie_raw:
         headers["cookie"] = cookie_raw
@@ -304,10 +304,20 @@ def walk_json(node, path="", out=None):
             walk_json(v, f"{path}[{i}]", out)
     return out
 
-def parse_transactions(payload):
+def order_list(payload):
+    """Find the actual order array in an escrow/transactions response (None = try legacy)."""
     if isinstance(payload, list):
-        tx = payload
-    else:
+        return payload
+    if isinstance(payload, dict):
+        for key in ("escrow_orders", "orders", "transactions", "data"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return v
+    return None
+
+def parse_transactions(payload):
+    tx = order_list(payload)
+    if tx is None:
         tx = payload.get("transactions") if isinstance(payload.get("transactions"), list) else list(payload.values())
     if not isinstance(tx, list):
         tx = []
@@ -315,14 +325,27 @@ def parse_transactions(payload):
     for t in tx:
         if not isinstance(t, dict):
             continue
-        order_id = str(t.get("id") or t.get("order_id") or "")
+        order_id = str(t.get("id") or t.get("order_id") or t.get("order_number") or "")
         if not order_id and isinstance(t.get("item"), dict):
             order_id = str(t["item"].get("id", ""))
         item = t.get("item") if isinstance(t.get("item"), dict) else {}
         details = walk_json(t)
+        # escrow-orders shape: item titles may hide under items[] / lines[]
+        nested_title = ""
+        for key in ("items", "lines", "escrow_order_items"):
+            arr = t.get(key)
+            if isinstance(arr, list) and arr:
+                first = arr[0]
+                if isinstance(first, dict):
+                    first = first.get("item") if isinstance(first.get("item"), dict) else first
+                    nested_title = first.get("title") or first.get("item_title") or ""
+                    break
+        shipment = t.get("shipment") if isinstance(t.get("shipment"), dict) else {}
+        parcel = t.get("parcel") if isinstance(t.get("parcel"), dict) else {}
+        state = t.get("state") or t.get("status") or shipment.get("status") or parcel.get("status") or ""
         info = {"order_id": order_id,
-                "title": item.get("title") or t.get("title") or "",
-                "state": t.get("state") or t.get("status") or "",
+                "title": item.get("title") or nested_title or t.get("title") or "",
+                "state": state,
                 "updated_at": t.get("updated_at") or t.get("created_at"),
                 "pickup": {}, "deadline": None, "raw": t}
         for p, k, v in details:
@@ -371,18 +394,25 @@ def fetch_state(acct):
     if not uid:
         return False, {"error": "no user id in /users/current", "body_keys": list(body.keys())}
 
-    code, txp = api_get(f"/api/v2/users/{uid}/transactions?role=buyer&page=1&per_page=50", base, ua, cookie_raw)
+    # Purchased orders live on the escrow API host (api.<domain>), current-user
+    # scoped (no uid in the URL). Referer matches the my_orders page.
+    api_host = re.sub(r"^www\.", "", domain)
+    escrow_base = f"https://api.{api_host}"
+    code, txp = api_get("/escrow-orders/api/v2/current-user/escrow-orders?page=1&per_page=20&type=purchased&status=in_progress",
+                        escrow_base, ua, cookie_raw, referer=f"{base}/my_orders?order_type=purchased")
     if is_datadome_block(code, txp):
         return False, {"error": "datadome_challenge"}
-    if code != 200:
-        return False, {"error": f"transactions HTTP {code}",
-                       "hint": "endpoint shape differs — inspect the logged raw response"}
     try:
         rawfile = os.path.join(DATA_DIR, f"txraw_{name}.json")
-        open(rawfile, "w").write(json.dumps(txp, indent=1))
+        open(rawfile, "w").write(json.dumps({"http": code, "orders": txp if code == 200 else str(txp), }, indent=1))
     except OSError:
         pass
+    if code != 200:
+        return False, {"error": f"escrow-orders HTTP {code}",
+                       "hint": "raw body dumped to txraw_%s.json — endpoint/auth/header mismatch" % name}
     parsed = parse_transactions(txp)
+    for t in parsed:
+        t.setdefault("track", None)
     return True, {"user_id": uid, "transactions": parsed}
 
 def fetch_vinted(acct) -> list:
