@@ -59,7 +59,7 @@ try:
                            j.status == 200
                            and srcs.count("vinted") == 3
                            and srcs.count("postnl") == 3
-                           and set(d.get("sources", {})) == {"vinted", "postnl"}))
+                           and set(d.get("sources", {})) == {"vinted/main", "postnl/main"}))
         except Exception as e:
             checks.append(("/api/overview.json ok", False))
             notes.append(f"/api/overview.json: {e}")

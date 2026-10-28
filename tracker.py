@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 # Parcel tracker — small poller + web UI, stdlib only
 # =========================================================
-# Runs on a home-network box (docker1.lan). Each configured SOURCE is polled
-# in turn, everything lands in a local SQLite db, a dashboard shows
-# what's waiting/where/until, and an optional generic webhook fires on change.
+# Runs on a home-network box (docker1.lan). Every configured ACCOUNT of every
+# configured SOURCE is polled in turn, everything lands in a local SQLite db,
+# a dashboard shows what's waiting/where/until, and an optional generic
+# webhook fires on change.
 #
-# Sources (all optional, any subset):
-#   vinted  — Vinted authenticated API, needs /data/cookies.json {"name":"value"}
-#             (session token + "datadome" clearance cookie) + matching USER_AGENT.
-#             File is reloaded live (mtime check) — no container restart.
-#   postnl  — PostNL consumer API via POSTNL_EMAIL/POSTNL_PASSWORD (headless
-#             PKCE login, tokens auto-refreshed into /data/postnl_token.json).
-#             Pulls incoming + outgoing shipments; no tracking codes to paste.
+# Configuration lives in DATA_DIR/config.json (hot-reloaded; see
+# config.example.json). Sources are lists of accounts — multiple accounts are
+# the norm:
+#   vinted  [{name, user_agent, domain, cookies_file}] — browser-cookie session
+#           (session token + datadome clearance cookie), file mtime-watched.
+#   postnl  [{name, email, password}] — headless PKCE login (tokens in
+#           postnl_token_<name>.json, auto-refreshed), incoming + outgoing.
+# Legacy env names (USER_AGENT, POSTNL_EMAIL, POSTNL_PASSWORD, VINTED_DOMAIN,
+# POLL_SECONDS, WEB_PORT, WEBHOOK_URL) are honoured only while config.json is
+# absent — a transition aid for existing installs.
 #
 # Run modes:
-#   python3 tracker.py            # normal operation (env-configured)
+#   python3 tracker.py            # normal operation (config.json)
 #   python3 tracker.py --sample   # serve built-in sample data, no network
-#
-# Env (all optional where noted):
-#   USER_AGENT          — vinted: exact UA of the browser the cookies came from
-#   POSTNL_EMAIL/...    — postnl: account email + password (leave empty to disable)
-#   VINTED_DOMAIN       — default www.vinted.nl
-#   POLL_SECONDS        — default 900 (15 min)
-#   WEB_PORT            — default 8080
-#   WEBHOOK_URL         — optional; POST JSON on every detected change
-#   DATA_DIR            — default /data
 
 import json, os, re, sqlite3, sys, threading, time
 import urllib.request
@@ -37,19 +32,101 @@ SAMPLE_MODE = "--sample" in sys.argv or os.environ.get("SAMPLE") == "1"
 
 # In sample mode (host runs, CI) /data usually doesn't exist — fall back to
 # a local dir unless DATA_DIR is set explicitly. Order matters: SAMPLE first.
-DATA_DIR   = os.environ.get("DATA_DIR", (".data" if SAMPLE_MODE else "/data"))
-DOMAIN     = os.environ.get("VINTED_DOMAIN", "www.vinted.nl")
-BASE       = "https://" + DOMAIN
-POLL_S     = int(os.environ.get("POLL_SECONDS", "900"))
-WEB_PORT   = int(os.environ.get("WEB_PORT", "8080"))
-USER_AGENT = os.environ.get("USER_AGENT", "")
-WEBHOOK    = os.environ.get("WEBHOOK_URL", "").strip()
-POSTNL_EMAIL    = os.environ.get("POSTNL_EMAIL", "").strip()
-POSTNL_PASSWORD = os.environ.get("POSTNL_PASSWORD", "").strip()
-DB_PATH    = os.path.join(DATA_DIR, "tracker.db")
-COOKIES    = os.path.join(DATA_DIR, "cookies.json")
-STATEFILE  = os.path.join(DATA_DIR, "snapshot.json")
-LOGPATH    = os.path.join(DATA_DIR, "poll.log")
+DATA_DIR  = os.environ.get("DATA_DIR", (".data" if SAMPLE_MODE else "/data"))
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+DB_PATH   = os.path.join(DATA_DIR, "tracker.db")
+STATEFILE = os.path.join(DATA_DIR, "snapshot.json")
+LOGPATH   = os.path.join(DATA_DIR, "poll.log")
+
+# Everything else (accounts, poll cadence, webhook, web port) lives in
+# DATA_DIR/config.json — see config.example.json. Legacy env names
+# (USER_AGENT, POSTNL_EMAIL, ...) are only honoured as a fallback while the
+# file is absent, with a nudge in poll.log.
+
+# ------------------------- config -------------------------
+
+DEFAULT_POLL_S = int(os.environ.get("POLL_SECONDS", "900"))   # legacy fallback
+DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))    # legacy fallback
+DEFAULT_POLL_S = max(30, DEFAULT_POLL_S)
+
+_cfg_cache = {"mtime": None, "cfg": None}
+CFG_LOCK = threading.Lock()
+
+def load_config() -> dict:
+    """DATA_DIR/config.json, hot-reloaded by mtime. Missing file → {}."""
+    with CFG_LOCK:
+        try:
+            mtime = os.stat(CONFIG_PATH).st_mtime
+        except OSError:
+            return _cfg_cache["cfg"] or {}
+        if _cfg_cache["mtime"] == mtime and _cfg_cache["cfg"] is not None:
+            return _cfg_cache["cfg"]
+        try:
+            cfg = json.loads(open(CONFIG_PATH).read())
+            if not isinstance(cfg, dict):
+                raise ValueError("config.json must be a JSON object")
+        except Exception as e:
+            log(f"config.json unreadable ({e}) — keeping previous config")
+            return _cfg_cache["cfg"] or {}
+        if _cfg_cache["cfg"] is not None:
+            log("config reloaded")
+        _cfg_cache.update(mtime=mtime, cfg=cfg)
+        return cfg
+
+def poll_seconds() -> int:
+    try:
+        v = int(load_config().get("poll_seconds", DEFAULT_POLL_S))
+    except (TypeError, ValueError):
+        v = DEFAULT_POLL_S
+    return max(30, v)
+
+def webhook_url() -> str:
+    return str(load_config().get("webhook_url") or "").strip()
+
+def acct_list(source: str) -> list:
+    """Enabled accounts for one source, from config.json (legacy env fallback)."""
+    if SAMPLE_MODE:
+        return [{"name": "main"}]
+    cfg = load_config()
+    srcs = cfg.get("sources") if isinstance(cfg.get("sources"), dict) else {}
+    accounts = srcs.get(source)
+    if not (isinstance(accounts, list) and accounts) and source in ("vinted", "postnl"):
+        leg = legacy_env_account(source)
+        if leg:
+            accounts = [leg]
+            if not log_warned["legacy"]:
+                log(f"config.json has no [{source}] accounts — using legacy env "
+                    f"(POSTNL_EMAIL/USER_AGENT). Migrate to config.json when easy.")
+                log_warned["legacy"] = True
+    seen, out = set(), []
+    for a in accounts or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "main")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,24}", name):
+            log(f"[{source}] skipping account with bad name: {name!r}")
+            continue
+        if name in seen:
+            log(f"[{source}] duplicate account name {name!r} — keeping the first")
+            continue
+        seen.add(name)
+        out.append(a)
+    return out
+
+log_warned = {"legacy": False}
+
+def legacy_env_account(source):
+    """Pre-config installs: single account from the old env names."""
+    if source == "postnl" and os.environ.get("POSTNL_EMAIL", "").strip():
+        return {"name": "main",
+                "email": os.environ["POSTNL_EMAIL"].strip(),
+                "password": os.environ.get("POSTNL_PASSWORD", "").strip()}
+    if source == "vinted" and os.environ.get("USER_AGENT", "").strip():
+        return {"name": "main",
+                "user_agent": os.environ["USER_AGENT"].strip(),
+                "domain": os.environ.get("VINTED_DOMAIN", "www.vinted.nl"),
+                "cookies_file": "cookies.json"}
+    return None
 
 # ------------------------- storage -------------------------
 
@@ -61,40 +138,61 @@ def db() -> sqlite3.Connection:
 NEW_SCHEMA = """
 CREATE TABLE IF NOT EXISTS transactions (
     source   TEXT NOT NULL DEFAULT 'vinted',
+    account  TEXT NOT NULL DEFAULT 'main',
     order_id TEXT NOT NULL,
     seen_at  REAL NOT NULL,
     state    TEXT,
     data     TEXT NOT NULL,
-    PRIMARY KEY (source, order_id)
+    PRIMARY KEY (source, account, order_id)
 );
 CREATE TABLE IF NOT EXISTS events (
     ts       REAL NOT NULL,
     source   TEXT NOT NULL DEFAULT 'vinted',
+    account  TEXT NOT NULL DEFAULT 'main',
     order_id TEXT NOT NULL,
     kind     TEXT NOT NULL,
     detail   TEXT
 );
 """
 
+def _rebuild_transactions(c, with_source, with_account):
+    """Rebuild transactions into the current (source, account, order_id) shape."""
+    log("migrating transactions schema (rebuilding table)")
+    c.executescript("ALTER TABLE transactions RENAME TO transactions_old;")
+    c.executescript(NEW_SCHEMA_TRANSACTIONS)
+    sel = [("source" if with_source else "'vinted'"), ("account" if with_account else "'main'")]
+    c.execute(f"INSERT OR REPLACE INTO transactions (source, account, order_id, seen_at, state, data) "
+              f"SELECT {sel[0]}, {sel[1]}, order_id, seen_at, state, data FROM transactions_old")
+    c.executescript("DROP TABLE transactions_old;")
+
+NEW_SCHEMA_TRANSACTIONS = """
+CREATE TABLE transactions (
+    source   TEXT NOT NULL DEFAULT 'vinted',
+    account  TEXT NOT NULL DEFAULT 'main',
+    order_id TEXT NOT NULL,
+    seen_at  REAL NOT NULL,
+    state    TEXT,
+    data     TEXT NOT NULL,
+    PRIMARY KEY (source, account, order_id)
+);
+"""
+
 def init_db():
     with db() as c:
-        info = c.execute("PRAGMA table_info(transactions)").fetchall()
-        pks = [r[1] for r in sorted(info, key=lambda r: r[5]) if r[5] > 0]
-        if info and pks == ["order_id"]:
-            log("migrating transactions: single-user db -> (source, order_id) key")
-            c.executescript("""
-                ALTER TABLE transactions RENAME TO transactions_old;
-            """)
-            c.executescript("CREATE TABLE transactions_new (source TEXT NOT NULL DEFAULT 'vinted', order_id TEXT NOT NULL,\n"
-                            "    seen_at REAL NOT NULL, state TEXT, data TEXT NOT NULL,\n"
-                            "    PRIMARY KEY (source, order_id));")
-            c.execute("INSERT OR REPLACE INTO transactions_new (source, order_id, seen_at, state, data) "
-                      "SELECT 'vinted', order_id, seen_at, state, data FROM transactions_old")
-            c.executescript("DROP TABLE transactions_old; ALTER TABLE transactions_new RENAME TO transactions;")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(transactions)")}
+        if {"source", "account", "order_id"} <= cols:
+            # shape already current — just ensure it exists
+            c.executescript(NEW_SCHEMA)
+        elif "source" in cols:
+            _rebuild_transactions(c, with_source=True, with_account=False)
+        elif "order_id" in cols:
+            _rebuild_transactions(c, with_source=False, with_account=False)
         c.executescript(NEW_SCHEMA)
         ev_cols = {r[1] for r in c.execute("PRAGMA table_info(events)")}
         if ev_cols and "source" not in ev_cols:
             c.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'vinted'")
+        if ev_cols and "account" not in ev_cols:
+            c.execute("ALTER TABLE events ADD COLUMN account TEXT NOT NULL DEFAULT 'main'")
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -112,54 +210,46 @@ def save_snapshot(summary):
     os.replace(tmp, STATEFILE)
 
 def post_webhook(payload):
-    if not WEBHOOK or not WEBHOOK.startswith("http"):
+    url = webhook_url()
+    if not url or not url.startswith("http"):
         return
     try:
-        req = urllib.request.Request(WEBHOOK, data=json.dumps(payload).encode(),
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json",
-                                              "User-Agent": "vinted-tracker/1.0"})
+                                              "User-Agent": "parcel-tracker/1.0"})
         urllib.request.urlopen(req, timeout=15)
         log(f"webhook delivered: {payload.get('kind')}")
     except Exception as e:
         log(f"webhook failed: {e}")
 
-# ------------------------- cookies -------------------------
+# ------------------------- cookies (per account file) -------------------------
 
-_cookie_cache = {"mtime": None, "raw": None}
+_cookie_cache: dict[str, dict] = {}   # path -> {"mtime", "raw"}
 COOKIE_LOCK = threading.Lock()
 
-def load_cookies():
+def load_cookies(path):
     """Accepts: {"name":"value",...} | {"cookies":{...}} | raw 'a=b; c=d' string."""
-    if SAMPLE_MODE:
-        return {"sample": "1"}
     with COOKIE_LOCK:
+        st = _cookie_cache.get(path, {})
         try:
-            mtime = os.stat(COOKIES).st_mtime
+            mtime = os.stat(path).st_mtime
         except OSError:
-            return _cookie_cache["raw"]    # file missing; keep last known
-        if _cookie_cache["mtime"] == mtime and _cookie_cache["raw"] is not None:
-            return _cookie_cache["raw"]
+            return st.get("raw")           # file missing; keep last known
+        if st.get("mtime") == mtime and st.get("raw") is not None:
+            return st["raw"]
         try:
-            txt = open(COOKIES).read().strip()
+            txt = open(path).read().strip()
         except OSError:
-            return _cookie_cache["raw"]
+            return st.get("raw")
         if txt.startswith("{"):
             d = json.loads(txt)
             pairs = d.get("cookies", d)
             raw = "; ".join(f"{k}={v}" for k, v in pairs.items())
         else:
             raw = txt                      # raw header string
-        _cookie_cache.update(mtime=mtime, raw=raw)
-        log(f"cookies reloaded ({len(raw)} chars)")
+        _cookie_cache[path] = {"mtime": mtime, "raw": raw}
+        log(f"cookies reloaded for {os.path.basename(path)} ({len(raw)} chars)")
         return raw
-
-def cookies_missing() -> list:
-    raw = load_cookies()
-    names = [m.group(2) for m in re.finditer(r'(?:(^|;)\s*|;)([A-Za-z0-9_.-]+)=', raw or "")]
-    missing = []
-    if ("datadome=" + ";") not in (f"{raw};" if raw else ""):
-        missing.append("datadome")
-    return missing
 
 # ------------------------- fetch -------------------------
 
@@ -172,15 +262,13 @@ BROWSER_HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
-def api_get(path):
-    url = f"{BASE}{path}"
-    headers = {"user-agent": USER_AGENT or "Mozilla/5.0",
-               "referer": f"{BASE}/",
+def api_get(path, base, ua, cookie_raw=None):
+    url = f"{base}{path}"
+    headers = {"user-agent": ua or "Mozilla/5.0",
+               "referer": f"{base}/",
                "x-requested-with": "XMLHttpRequest"}
-    if not SAMPLE_MODE:
-        raw = load_cookies()
-        if raw:
-            headers["cookie"] = raw
+    if cookie_raw:
+        headers["cookie"] = cookie_raw
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -259,9 +347,20 @@ def parse_transactions(payload):
 
 # ------------------------- poll loop -------------------------
 
-def fetch_state():
+def fetch_state(acct):
     """returns (ok, data) — data carries user id + parsed transactions."""
-    code, body = api_get("/api/v2/users/current")
+    domain = acct.get("domain") or "www.vinted.nl"
+    base = f"https://{domain}"
+    ua = acct.get("user_agent") or os.environ.get("USER_AGENT", "")
+    name = acct.get("name") or "main"
+    cookie_raw = None
+    if not SAMPLE_MODE:
+        cookie_path = os.path.join(DATA_DIR, acct.get("cookies_file") or "cookies.json")
+        cookie_raw = load_cookies(cookie_path)
+        if not cookie_raw:
+            return False, {"error": f"cookies file missing/empty ({cookie_path})",
+                           "hint": "copy cookies into data/ per config.json"}
+    code, body = api_get("/api/v2/users/current", base, ua, cookie_raw)
     if is_datadome_block(code, body):
         return False, {"error": "datadome_challenge"}
     if code != 200 or not isinstance(body.get("user", body), dict):
@@ -272,81 +371,106 @@ def fetch_state():
     if not uid:
         return False, {"error": "no user id in /users/current", "body_keys": list(body.keys())}
 
-    code, txp = api_get(f"/api/v2/users/{uid}/transactions?role=buyer&page=1&per_page=50")
+    code, txp = api_get(f"/api/v2/users/{uid}/transactions?role=buyer&page=1&per_page=50", base, ua, cookie_raw)
     if is_datadome_block(code, txp):
         return False, {"error": "datadome_challenge"}
     if code != 200:
         return False, {"error": f"transactions HTTP {code}",
                        "hint": "endpoint shape differs — inspect the logged raw response"}
-    with db() as c:
-        open(COOKIES.replace("cookies.json", "txraw_last.json"), "w").write(json.dumps(txp, indent=1))
+    try:
+        rawfile = os.path.join(DATA_DIR, f"txraw_{name}.json")
+        open(rawfile, "w").write(json.dumps(txp, indent=1))
+    except OSError:
+        pass
     parsed = parse_transactions(txp)
     return True, {"user_id": uid, "transactions": parsed}
 
-def fetch_vinted() -> list:
-    ok, data = fetch_state()
+def fetch_vinted(acct) -> list:
+    if SAMPLE_MODE:
+        path = os.path.join(os.path.dirname(__file__) or ".", "sample", "sample.json")
+        txs = parse_transactions(json.load(open(path))["transactions"])
+        for t in txs:
+            t["source"] = "vinted"; t["account"] = acct.get("name") or "main"
+            t.setdefault("role", "in"); t.setdefault("track", None)
+        return txs
+    ok, data = fetch_state(acct)
     if not ok:
         raise RuntimeError(data.get("error", "unknown"))
     for t in data["transactions"]:
         t["source"] = "vinted"
+        t["account"] = acct.get("name") or "main"
         t.setdefault("role", "in")
         t.setdefault("track", None)
     return data["transactions"]
 
 # ------------------------- postnl source -------------------------
 
-POSTNL_TOKENPATH = os.path.join(DATA_DIR, "postnl_token.json")
+def postnl_token_path(account):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", account or "main")
+    return os.path.join(DATA_DIR, f"postnl_token_{safe}.json")
 
-def _load_postnl_token():
+def _load_postnl_token(path):
     try:
-        with open(POSTNL_TOKENPATH) as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
         return None
 
-def _save_postnl_token(tok):
-    tmp = POSTNL_TOKENPATH + ".tmp"
+def _save_postnl_token(path, tok):
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(tok, f)
-    os.replace(tmp, POSTNL_TOKENPATH)
+    os.replace(tmp, path)
 
-def fetch_postnl() -> list:
+def fetch_postnl(acct) -> list:
+    name = acct.get("name") or "main"
     if SAMPLE_MODE:
         path = os.path.join(os.path.dirname(__file__) or ".", "sample", "postnl.json")
-        return json.load(open(path))
-    c = postnl_mod.Client()
-    tok = _load_postnl_token()
-    if not tok or tok.get("expires_at", 0) - 30 < time.time():
-        fresh = None
-        if tok and tok.get("refresh_token"):
-            try:
-                fresh = postnl_mod.refresh(c, tok["refresh_token"])
-                if not fresh.get("refresh_token"):
-                    fresh["refresh_token"] = tok["refresh_token"]
-            except postnl_mod.PostNLError:
-                fresh = None
-        if not fresh:
-            fresh = postnl_mod.login(POSTNL_EMAIL, POSTNL_PASSWORD)
-        _save_postnl_token(fresh)
-        tok = fresh
-    sh = postnl_mod.shipments(c, tok["access_token"])
-    out = []
-    for role, listkey in (("in", "receiver"), ("out", "sender")):
-        for s in sh.get(listkey, []):
-            tt = {} if s.get("delivered") else postnl_mod.track_and_trace(
-                c, tok["access_token"], s.get("key") or "")
-            n = postnl_mod.parse_shipment(s, tt, role)
-            if n:
-                out.append(n)
-    return out
+    else:
+        if not (acct.get("email") and acct.get("password")):
+            raise RuntimeError("postnl account misconfigured: email/password needed")
+        tokpath = postnl_token_path(name)
+        c = postnl_mod.Client()
+        tok = _load_postnl_token(tokpath)
+        if not tok or tok.get("expires_at", 0) - 30 < time.time():
+            fresh = None
+            if tok and tok.get("refresh_token"):
+                try:
+                    fresh = postnl_mod.refresh(c, tok["refresh_token"])
+                    if not fresh.get("refresh_token"):
+                        fresh["refresh_token"] = tok["refresh_token"]
+                except postnl_mod.PostNLError:
+                    fresh = None
+            if not fresh:
+                fresh = postnl_mod.login(acct["email"], acct["password"])
+            _save_postnl_token(tokpath, fresh)
+            tok = fresh
+        sh = postnl_mod.shipments(c, tok["access_token"])
+        out = []
+        for role, listkey in (("in", "receiver"), ("out", "sender")):
+            for s in sh.get(listkey, []):
+                tt = {} if s.get("delivered") else postnl_mod.track_and_trace(
+                    c, tok["access_token"], s.get("key") or "")
+                n = postnl_mod.parse_shipment(s, tt, role)
+                if n:
+                    n["account"] = name
+                    out.append(n)
+        return out
+    txs = json.load(open(path))
+    for t in txs:
+        t["account"] = name
+    return txs
 
 def active_sources():
-    srcs = []
-    if SAMPLE_MODE or USER_AGENT:
-        srcs.append(("vinted", fetch_vinted))
-    if SAMPLE_MODE or (POSTNL_EMAIL and POSTNL_PASSWORD):
-        srcs.append(("postnl", fetch_postnl))
-    return srcs
+    """One entry per configured account: (source, account, fetch, key)."""
+    out = []
+    for acct in acct_list("vinted"):
+        name = acct.get("name") or "main"
+        out.append(("vinted", name, lambda a=acct: fetch_vinted(a), f"vinted/{name}"))
+    for acct in acct_list("postnl"):
+        name = acct.get("name") or "main"
+        out.append(("postnl", name, lambda a=acct: fetch_postnl(a), f"postnl/{name}"))
+    return out
 
 def poll_once():
     seen = time.time()
@@ -354,36 +478,37 @@ def poll_once():
     parsed_all = []
     changes = []
     with db() as c:
-        old = {r["source"] + "|" + r["order_id"]: r["state"]
-               for r in c.execute("SELECT source, order_id, state FROM transactions")}
-    for name, fetch in active_sources():
+        old = {r["source"] + "|" + r["account"] + "|" + r["order_id"]: r["state"]
+               for r in c.execute("SELECT source, account, order_id, state FROM transactions")}
+    for source, account, fetch, key in active_sources():
         try:
             txs = fetch()
-            sources_state[name] = {"ok": True, "count": len(txs)}
+            sources_state[key] = {"ok": True, "count": len(txs)}
         except postnl_mod.InvalidCredentials as e:
-            sources_state[name] = {"ok": False, "error": "bad_credentials", "detail": str(e)[:120]}
-            log("PostNL rejected credentials — ACTION: check POSTNL_EMAIL / POSTNL_PASSWORD")
+            sources_state[key] = {"ok": False, "error": "bad_credentials", "detail": str(e)[:120]}
+            log("PostNL rejected credentials — ACTION: fix the account's email/password in config.json")
             continue
         except Exception as e:
-            sources_state[name] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:140]}"}
-            log(f"source {name} failed: {sources_state[name]['error']}")
+            sources_state[key] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:140]}"}
+            log(f"source {key} failed: {sources_state[key]['error']}")
             if "datadome" in str(type(e).__name__) + str(e):
-                log("ACTION: copy fresh cookies (session + datadome) into cookies.json")
+                log("ACTION: copy fresh cookies (session + datadome) into the account's cookies file")
             continue
         with db() as c:
             for t in txs:
                 oid = t["order_id"] or f"anon-{(t.get('title') or '')[:20]}"
-                prev = old.get(name + "|" + oid)
-                c.execute("INSERT OR REPLACE INTO transactions (source, order_id, seen_at, state, data) VALUES (?,?,?,?,?)",
-                          (name, oid, seen, t.get("state"), json.dumps(t)))
+                prev = old.get(source + "|" + account + "|" + oid)
+                c.execute("INSERT OR REPLACE INTO transactions (source, account, order_id, seen_at, state, data) VALUES (?,?,?,?,?,?)",
+                          (source, account, oid, seen, t.get("state"), store_row(t)))
                 if prev is None:
                     continue                      # first sighting: not a change event
                 if prev != (t.get("state") or ""):
-                    c.execute("INSERT INTO events (ts, source, order_id, kind, detail) VALUES (?,?,?,?,?)",
-                              (seen, name, oid, "state", f"{prev} -> {t.get('state')}"))
-                    changes.append(f"[{name}] {oid}: {prev} -> {t.get('state')}")
+                    c.execute("INSERT INTO events (ts, source, account, order_id, kind, detail) VALUES (?,?,?,?,?,?)",
+                              (seen, source, account, oid, "state", f"{prev} -> {t.get('state')}"))
+                    changes.append(f"[{key}] {oid}: {prev} -> {t.get('state')}")
         parsed_all.extend(txs)
-    slim = [{"source": t["source"], "order_id": t["order_id"], "role": t.get("role", "in"),
+    slim = [{"source": t["source"], "account": t.get("account", "main"),
+             "order_id": t["order_id"], "role": t.get("role", "in"),
              "title": t.get("title"), "state": t.get("state"), "pickup": t.get("pickup", {}),
              "deadline": t.get("deadline"), "track": t.get("track"),
              "updated_at": t.get("updated_at")} for t in parsed_all]
@@ -404,7 +529,7 @@ def poller_loop():
             poll_once()
         except Exception as e:
             log(f"poll exception: {e}")
-        time.sleep(POLL_S)
+        time.sleep(poll_seconds())
 
 # ------------------------- web UI -------------------------
 
@@ -472,7 +597,13 @@ def store_row(info):
 
 def db_rows(con):
     """All parcels, newest first. Handles pre-multi-source rows (re-parsed)."""
-    rows = con.execute("SELECT source, order_id, state, seen_at, data FROM transactions ORDER BY seen_at DESC").fetchall()
+    cols = [r[1] for r in con.execute("PRAGMA table_info(transactions)")]
+    if "account" in cols:
+        rows = con.execute("SELECT source, account, order_id, state, seen_at, data FROM transactions ORDER BY seen_at DESC").fetchall()
+    else:
+        rows = [{"source": r["source"], "account": "main", "order_id": r["order_id"],
+                 "state": r["state"], "seen_at": r["seen_at"], "data": r["data"]}
+                for r in con.execute("SELECT source, order_id, state, seen_at, data FROM transactions ORDER BY seen_at DESC")]
     out = []
     for r in rows:
         try:
@@ -487,6 +618,7 @@ def db_rows(con):
             info[0]["state"] = r["state"]
             info[0]["order_id"] = r["order_id"]
             info[0]["source"] = "vinted"
+            info[0]["account"] = r.get("account", "main")
             info[0].setdefault("role", "in")
             d = info[0]
         else:
@@ -525,6 +657,9 @@ def render_transactions(rows, heading, note=""):
         if t.get("track"):
             title = f"<a href='{t['track']}'>{title}</a>"
         src = (t.get("source") or "vinted")
+        acct = (t.get("account") or "").strip()
+        if acct and acct != "main":
+            src = f"{src}/{acct}"
         out += (f"<tr><td>{title}<div class='muted'>{t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{'; '.join(str(v) for v in (t.get('pickup') or {}).values() if v) or '—'}</td>"
@@ -533,14 +668,17 @@ def render_transactions(rows, heading, note=""):
     return out + "</table>"
 
 def render_history(con):
-    rows = con.execute("SELECT ts, source, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 100").fetchall()
+    if "account" in [r[1] for r in con.execute("PRAGMA table_info(events)")]:
+        rows = con.execute("SELECT ts, source, account, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 100").fetchall()
+    else:
+        rows = con.execute("SELECT ts, 'vinted' AS source, 'main' AS account, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 100").fetchall()
     out = "<h2>History</h2>"
     if not rows:
         return out + '<p class="muted">no events recorded yet</p>'
     out += "<table><tr><th>When</th><th>Order</th><th>Change</th></tr>"
     for r in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"]))
-        name = r["source"] if "source" in r.keys() else "vinted"
+        name = r["source"] if r["account"] in ("main", "") else f"{r['source']}/{r['account']}"
         out += f"<tr><td class='muted'>{when}</td><td class='muted'>[{name}] {r['order_id']}</td><td>{r['detail'] or r['kind']}</td></tr>"
     return out + "</table>"
 
@@ -555,10 +693,10 @@ def build_page():
         cls = "" if st.get("ok") else "bad"
         label = name if st.get("ok") else f"{name} ⚠ {st.get('error','')[:28]}"
         src_dots += f"<span class='srcline'><span class='rdot {cls}'></span>{label}</span>"
-    fresh = [t for t in rows if time.time() - t["seen_at"] < POLL_S * 3]
+    fresh = [t for t in rows if time.time() - t["seen_at"] < poll_seconds() * 3]
     waiting = [t for t in fresh if is_waiting(t.get("state"), t.get("role", "in"))]
     others  = [t for t in fresh if t not in waiting]
-    stale = bool(last_seen and (time.time() - last_seen) > POLL_S * 3)
+    stale = bool(last_seen and (time.time() - last_seen) > poll_seconds() * 3)
     dot = "stale" if stale else ""
     if not rows:
         others_note = "nothing yet"
@@ -600,7 +738,10 @@ class Handler(BaseHTTPRequestHandler):
                 "transactions": out, "sources": snap}))
         elif path == "/api/history.json":
             with db() as c:
-                ev = [dict(r) for r in c.execute("SELECT ts, source, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 200")]
+                if "account" in [r[1] for r in c.execute("PRAGMA table_info(events)")]:
+                    ev = [dict(r) for r in c.execute("SELECT ts, source, account, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 200")]
+                else:
+                    ev = [dict(r) for r in c.execute("SELECT ts, source, 'main' AS account, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 200")]
             self._send(200, "application/json", json.dumps(ev))
         else:
             self._send(404, "text/html", "<h1>404</h1>")
@@ -616,19 +757,21 @@ def seed_sample():
     vpath = os.path.join(os.path.dirname(__file__) or ".", "sample", "sample.json")
     vinted = parse_transactions(json.load(open(vpath))["transactions"])
     for t in vinted:
-        t["source"] = "vinted"
+        t["source"] = "vinted"; t["account"] = "main"
         t.setdefault("role", "in")
     parsed.extend(vinted)
     ppath = os.path.join(os.path.dirname(__file__) or ".", "sample", "postnl.json")
     postnl_tx = json.load(open(ppath))
+    for t in postnl_tx:
+        t["account"] = t.get("account") or "main"
     parsed.extend(postnl_tx)
-    sources_state = {"vinted": {"ok": True, "count": len(vinted)},
-                     "postnl": {"ok": True, "count": len(postnl_tx)}}
+    sources_state = {"vinted/main": {"ok": True, "count": len(vinted)},
+                     "postnl/main": {"ok": True, "count": len(postnl_tx)}}
     seen = time.time()
     with db() as con:
         for t in parsed:
-            con.execute("INSERT OR REPLACE INTO transactions (source, order_id, seen_at, state, data) VALUES (?,?,?,?,?)",
-                        (t["source"], t["order_id"], seen, t["state"], store_row(t)))
+            con.execute("INSERT OR REPLACE INTO transactions (source, account, order_id, seen_at, state, data) VALUES (?,?,?,?,?,?)",
+                        (t["source"], t["account"], t["order_id"], seen, t["state"], store_row(t)))
     save_snapshot({"ts": seen, "sources": sources_state,
                    "transactions": parsed, "changes": []})
     log("sample data seeded")
@@ -638,9 +781,14 @@ def main():
     init_db()
     if SAMPLE_MODE:
         seed_sample()
+    else:
+        n = sum(len(acct_list(s)) for s in ("vinted", "postnl"))
+        if load_config() and not n:
+            log("config.json has no enabled accounts — dashboard will be empty until accounts are added")
     threading.Thread(target=poller_loop, daemon=True).start()
-    srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
-    log(f"serving on :{WEB_PORT} (sample={SAMPLE_MODE})")
+    web_port = int(load_config().get("web_port") or DEFAULT_WEB_PORT)
+    srv = ThreadingHTTPServer(("0.0.0.0", web_port), Handler)
+    log(f"serving on :{web_port} (sample={SAMPLE_MODE})")
     srv.serve_forever()
 
 if __name__ == "__main__":

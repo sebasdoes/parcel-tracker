@@ -1,20 +1,22 @@
 # docker1 service block (podman compose, CoreOS)
 # Put me in /srv/<name>/compose (or however the docker1 stack is laid out) — I publish
 # LAN-only by design: the site is for the household, the poller needs no TLS.
+#
+# ALL configuration lives in ./data/config.json now (see config.example.json in
+# the repo) — accounts, poll cadence, webhook, web port. No env vars needed.
+# The file is hot-reloaded (mtime): adding an account or editing cadence needs
+# no container restart.
 services:
-  vinted-tracker:
+  parcel-tracker:
     image: ghcr.io/sebasdoes/parcel-tracker:latest   # or build: .
-    container_name: vinted-tracker
+    container_name: parcel-tracker
     restart: unless-stopped
+    environment:
+      # legacy names only, honoured while config.json is absent:
+      #   USER_AGENT, POSTNL_EMAIL, POSTNL_PASSWORD, POLL_SECONDS, VINTED_DOMAIN
+      - DATA_DIR=/data
     ports:
       - "8085:8080"          # LAN only — no reverse proxy needed; the data is behind the LAN
-    environment:
-      - USER_AGENT=${USER_AGENT}          # vinted: REQUIRED if cookies.json present
-      - POSTNL_EMAIL=${POSTNL_EMAIL}      # postnl source: leave empty to disable
-      - POSTNL_PASSWORD=${POSTNL_PASSWORD}
-      - POLL_SECONDS=900                  # 15 min
-      - VINTED_DOMAIN=www.vinted.nl       # cookie domain matters
-      # - WEBHOOK_URL=...                # optional change-broadcast (ntfy/matrix/... generic POST)
     volumes:
-      - ./data:/data:Z                    # cookies.json + SQLite + snapshot live here
+      - ./data:/data:Z       # config.json + cookies*.json + SQLite + tokens live here
     # SELinux: CoreOS podman needs :Z on bind mounts

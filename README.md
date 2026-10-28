@@ -23,10 +23,41 @@ Hermes reads /data/snapshot.json over SSH — ask it anything in chat, anytime.
 
 ## Setup
 
-### 1. Cookies (your part, ~60 seconds, once every few weeks)
+### 1. `data/config.json` — the single configuration file
+
+Everything is configured in one JSON file (hot-reloaded by mtime — edits need
+no container restart). Copy `config.example.json` to `data/config.json` and
+edit:
+
+```json
+{
+  "poll_seconds": 900,
+  "webhook_url": "",
+  "sources": {
+    "vinted": [
+      {"name": "main",
+       "user_agent": "Mozilla/5.0 ...exact UA of that browser...",
+       "domain": "www.vinted.nl",
+       "cookies_file": "cookies.json"}
+    ],
+    "postnl": [
+      {"name": "main", "email": "you@example.nl", "password": "***"}
+    ]
+  }
+}
+```
+
+**Multiple accounts are supported and normal:** every source takes a *list* of
+accounts. Each needs a unique `name` (letters/digits/`.`, `-`, `_`); the token
+or cookie state is per account (`postnl_token_<name>.json`,
+cookies/txraw files per account). Drop an account out of the list and its rows
+simply stop refreshing.
+
+### 2. Vinted cookies (your part, ~60 seconds, once every few weeks)
 
 Log in to Vinted in your browser, open DevTools → **Application → Cookies →
-https://www.vinted.nl** and copy **all cookies** into `data/cookies.json`:
+https://www.vinted.nl** and copy **all cookies** into the file named by
+`cookies_file` (default `data/cookies.json`):
 
 ```json
 {
@@ -37,50 +68,37 @@ https://www.vinted.nl** and copy **all cookies** into `data/cookies.json`:
 ```
 
 A pasted raw header string (`a=1; b=2`) also works — the file accepts either
-shape.
-
-**Also set `USER_AGENT`** (env) to the *exact* User-Agent of that browser
+shape. `user_agent` **must** be the *exact* User-Agent of that browser
 (DevTools → Console → `navigator.userAgent`). DataDome scores cookie
-consistency against the IP and UA; a mismatched UA raises challenge risk.
+consistency against IP and UA; a mismatched UA raises challenge risk.
 
-The container **watches the file's mtime** — refresh = overwrite the file, no
-restart.
-
-### 2. Compose (docker1.lan)
+### 3. Compose (docker1.lan)
 
 ```yaml
 services:
-  vinted-tracker:
+  parcel-tracker:
     image: ghcr.io/sebasdoes/parcel-tracker:latest
-    container_name: vinted-tracker
+    container_name: parcel-tracker
     restart: unless-stopped
     ports:
       - "8085:8080"
-    environment:
-      - USER_AGENT=${USER_AGENT}   # from .env next to the compose file
-      - POLL_SECONDS=900
-      - VINTED_DOMAIN=www.vinted.nl
     volumes:
       - ./data:/data:Z             # SELinux label — CoreOS podman needs :Z
 ```
 
-`echo 'USER_AGENT=Mozilla/5.0 ...' > .env` next to the compose file, then
-`docker compose up -d`. Dashboard: `http://docker1.lan:8085/`.
+No env vars needed — `config.json` in the mounted volume carries all
+configuration (legacy env names still work while `config.json` is absent, for
+existing installs). Then `podman compose up -d`. Dashboard:
+`http://docker1.lan:8085/`.
 
-### 2b. PostNL source (optional — add to the same compose)
+### 3b. PostNL source
 
-```yaml
-    environment:
-      - POSTNL_EMAIL=${POSTNL_EMAIL}        # jouw.postnl.nl / app email
-      - POSTNL_PASSWORD=${POSTNL_PASSWORD}
-```
-
-Headless login (PKCE flow against login.postnl.nl, same as the community HA
-integration), tokens auto-refreshed and stored in `data/postnl_token.json`;
-password is used only when both refresh and login-retry are needed. Pulls all
-incoming **and** outgoing shipments for the account — no tracking codes to
-paste. A bonus: AliExpress parcels whose NL leg travels via PostNL show up
-here automatically.
+Just list the account under `sources.postnl`. Headless login (PKCE flow
+against login.postnl.nl, same as the community HA integration), tokens
+auto-refreshed and stored per-account; the password is used only when both
+refresh and login-retry are needed. Pulls all incoming **and** outgoing
+shipments — no tracking codes to paste. A bonus: AliExpress parcels whose NL
+leg travels via PostNL show up here automatically.
 
 **Not onboarded (yet): AliExpress order auto-discovery.** AliExpress signs
 every API call (mtop) and some endpoints demand extra anti-bot tokens —
@@ -89,15 +107,15 @@ Cainiao tracking-by-number works anonymously if we ever want the manual path.
 
 | Symptom | Meaning | Fix |
 |---|---|---|
-| `PostNL rejected credentials` in poll.log | wrong email/password | fix the env values |
+| `PostNL rejected credentials` in poll.log | wrong email/password | fix the account in config.json |
 | postnl ⚠ transient error | login hiccup (recaptcha/rate limit) or API blip | retries next poll — persistent failures: check container logs |
 
-### 3. First-run endpoint discovery
+### 4. First-run endpoint discovery
 
 The first successful poll writes the **raw API response** to
-`data/txraw_last.json`. If field names in the UI look off (Vinted's payload is
-reverse-engineered; `pick_up_point` and `pickup_expires_at` are guesses), the
-raw file is the ground truth to adjust the parser against.
+`data/txraw_<account>.json`. If field names in the UI look off (Vinted's
+payload is reverse-engineered; `pick_up_point` and `pickup_expires_at` are
+guesses), the raw file is the ground truth to adjust the parser against.
 
 ## Ops
 
@@ -106,15 +124,15 @@ raw file is the ground truth to adjust the parser against.
 | `poll failed: datadome_challenge` in poll.log | DataDome cookie invalidated | Re-copy fresh cookies → next poll recovers |
 | `poll failed: transactions HTTP 401/…` | session JWT expired | Same: re-copy cookies |
 | dashboard dot yellow | tracker stale (>3 poll intervals quiet) | check container logs |
-| no dashboard | container down / port clash | `docker logs vinted-tracker` |
+| no dashboard | container down / port clash | `docker logs parcel-tracker` |
 
-Webhook (optional): `WEBHOOK_URL` receives a POST
-`{"source":"vinted-tracker","kind":"change","detail":"..."}` on every detected
-transaction-state change — point it at ntfy/matrix/anything.
+Webhook (optional): `webhook_url` in config.json receives a POST
+`{"source":"parcel-tracker","kind":"change","detail":"..."}` on every detected
+state change — point it at ntfy/matrix/anything.
 
 ## What is stored
 
-- `tracker.db` — `transactions` (latest state per order, normalized dict preserved) + `events` (state changes, appended)
-- `snapshot.json` — latest normalized overview + per-source health (what Hermes reads)
-- `postnl_token.json` — PostNL access/refresh tokens (created when the PostNL source is on)
+- `tracker.db` — `transactions` keyed `(source, account, order_id)`, normalized dict preserved + `events` (state changes, appended)
+- `snapshot.json` — latest normalized overview + per-source/account health (what Hermes reads)
+- `postnl_token_<account>.json` — PostNL access/refresh tokens (per account; created when that account polls)
 - Nothing leaves the box except the optional webhook you configure.
