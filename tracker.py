@@ -1315,6 +1315,32 @@ def read_snapshot_sources():
     except Exception:
         return {}
 
+import datetime as _dt
+
+def _parse_iso(s):
+    try:
+        return _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def rel_time(iso):
+    """'5 days ago' / 'in 8 hours' for an ISO timestamp; None if unparseable."""
+    d = _parse_iso(iso)
+    if d is None:
+        return None
+    dt = d.timestamp() - time.time()
+    future = dt > 0
+    m = abs(dt) / 60.0
+    if m < 1: return "just now"
+    if m < 60: txt = f"{int(m)} min"
+    elif m < 60 * 24: txt = f"{int(m / 60)} hour{'s' if int(m / 60) != 1 else ''}"
+    elif m < 60 * 24 * 14: txt = f"{int(m / 1440)} day{'s' if int(m / 1440) != 1 else ''}"
+    else: txt = f"{int(m / 10080)} weeks"
+    return (f"in {txt}" if future else f"{txt} ago").strip()
+
+def esc(s):
+    return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+
 def until_display(value):
     """Return (iso_or_None, plain_text) for a deadline field."""
     s = str(value or "").strip()
@@ -1333,7 +1359,12 @@ def render_transactions(rows, heading, note="", since_label=False):
     fourth = "Since" if since_label else "Until"
     out += f"<div class='tablewrap'><table><tr><th>Item</th><th>Status</th><th>Where</th><th>{fourth}</th></tr>"
     for t in rows:
-        until_iso, until_plain = until_display(t.get("deadline"))
+        deadline = t.get("deadline") or ""
+        since_m = re.search(r"(\d{4}-\d{2}-\d{2}T[0-9:+\-]+)", deadline)
+        if since_m:
+            until_iso, until_plain = since_m.group(1), (rel_time(since_m.group(1)) or since_m.group(1)[:16].replace("T", " "))
+        else:
+            until_iso, until_plain = until_display(deadline)
         until_attr = f' data-until="{until_iso}" data-show="{until_iso[:10]}"' if until_iso else ""
         title = t.get("title") or ""
         if t.get("track"):
@@ -1355,7 +1386,7 @@ def render_transactions(rows, heading, note="", since_label=False):
         out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{where or '—'}</td>"
-                f"<td{until_attr}>{(until_plain or '—') + retention_note(t)}</td></tr>")
+                f"<td{until_attr + (f' title=\"{esc(until_iso)}\"' if until_iso else '')}>{((rel_time(until_iso) or until_plain) if until_iso else until_plain or '—') + retention_note(t)}</td></tr>")
     return out + "</table></div>"
 
 def render_history(con):
