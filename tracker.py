@@ -423,10 +423,6 @@ def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
     return raw_map, changed
 
 
-def tmp_loc(cmap):
-    m = re.search(r"_vinted_([a-z]{2})_session", " " + " ".join(cmap))
-    return f"home={m.group(1)}" if m else "no session-cookie domain hint"
-
 def vinted_csrf(base, ua, cookie_raw, name):
     """Harvest the csrf token the SPA pairs with its session: homepage meta tag
     (cookies on some stacks carry csrf_token; ours doesn't)."""
@@ -449,53 +445,62 @@ def vinted_csrf(base, ua, cookie_raw, name):
         log(f"[{name}] csrf harvest failed: {type(e).__name__}")
         return "", []
 
-def vinted_refresh(base, ua, cookie_raw, csrf="", name="", want_csrf=True):
-    """POST /oauth/token (vinted-mcp shape). Returns (access_token, set_cookie_lines).
-    Logs the failure body — that detail is the whole debug story."""
+CLIENT_CANDIDATES = ("web", "ios", "android", "bff", "spa", "app", "vinted", "public")
+
+def _saved_client(name):
+    p = os.path.join(DATA_DIR, f"vinted_client_{(name or 'main').replace(' ', '_')}.json")
+    try:
+        return json.load(open(p)).get("client_id")
+    except Exception:
+        return None
+
+def _save_client(name, cid):
+    p = os.path.join(DATA_DIR, f"vinted_client_{(name or 'main').replace(' ', '_')}.json")
+    try:
+        open(p, "w").write(json.dumps({"client_id": cid, "at": time.time()}))
+    except OSError:
+        pass
+
+def vinted_refresh(base, ua, cookie_raw, csrf="", name=""):
+    """POST /oauth/token until a client_id accepts the grant (candidates probed once,
+    per-account winner remembered). Returns (access_token, set_cookie_lines)."""
     cm = cookie_map(cookie_raw)
     rt = cm.get("refresh_token_web", "")
     if not rt:
         log(f"[{name}] refresh: no refresh_token_web in cookie file")
         return None, []
-    attempts = []
-    if csrf:
-        attempts.append(("application/json", {"grant_type": "refresh_token", "refresh_token": rt}))
-        attempts.append(("application/x-www-form-urlencoded",
-                         urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()))
-    else:
-        attempts.append(("application/json", {"grant_type": "refresh_token", "refresh_token": rt}))
-    for ctype, payload in attempts:
-        if isinstance(payload, dict):
-            data = json.dumps(payload).encode()
-        else:
-            data = payload
-        if ctype == "application/json" and csrf:
-            extra = {"x-csrf-token": csrf}
-        else:
-            extra = {}
-        req = urllib.request.Request(f"{base}/oauth/token", data=data,
-                                     headers={"content-type": ctype,
+    saved = _saved_client(name)
+    candidates = ([saved] if saved else []) + [c for c in CLIENT_CANDIDATES if c != saved]
+    for cid in candidates:
+        payload = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+        req = urllib.request.Request(f"{base}/oauth/token",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"content-type": "application/json",
                                               "accept": "application/json",
                                               "user-agent": ua or "Mozilla/5.0",
                                               "cookie": cookie_raw,
-                                              **extra})
+                                              **({"x-csrf-token": csrf} if csrf else {})})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 at = json.loads(r.read().decode()).get("access_token")
                 if at:
-                    log(f"[{name}] refresh OK ({ctype}, csrf={'yes' if csrf else 'no'})")
+                    _save_client(name, cid)
+                    if cid != saved:
+                        log(f"[{name}] refresh OK with client_id={cid!r} (saved for future polls)")
                     return at, r.headers.get_all("Set-Cookie") or []
-                log(f"[{name}] refresh answered 200 without access_token ({ctype})")
+                log(f"[{name}] refresh 200-no-token with client_id={cid!r}")
         except HTTPError as e:
-            body = e.read().decode("utf-8", "replace")[:200]
-            log(f"[{name}] refresh POST HTTP {e.code} ({ctype}, csrf={'yes' if csrf else 'no'}): {body}")
-            if e.code in (403, 429):
-                return None, e.headers.get_all("Set-Cookie") or []   # datadome/rate: stop, retry whole flow later w/ cookies from caller
+            body = e.read().decode("utf-8", "replace")[:160]
+            code = e.code
+            if code == 401:
+                log(f"[{name}] refresh: client_id={cid!r} -> rejected ({body})")   # try next candidate
+            else:
+                log(f"[{name}] refresh POST HTTP {code} (client_id={cid!r}): {body}")
+                return None, e.headers.get_all("Set-Cookie") or []   # datadome/rate/network: stop
         except Exception as e:
-            log(f"[{name}] refresh error {type(e).__name__} ({ctype})")
+            log(f"[{name}] refresh error {type(e).__name__} (client_id={cid!r})")
     return None, []
 
-VINTED_META: dict[str, dict] = {}
 
 def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
     """Proactive: refresh access_token_web when its JWT expires within REFRESH_MARGIN."""
@@ -537,21 +542,10 @@ def fetch_state(acct):
             return False, {"error": f"cookies file missing/empty ({cookie_path})",
                            "hint": "copy cookies into data/ per config.json"}
         cmap = cookie_map(cookie_raw)
-        # The session cookie carries the account's home domain (_vinted_fr_session
-        # etc.). OAuth grants are per-domain clients — posting a .fr refresh token
-        # at .nl yields invalid_grant ("issued to another client"). Trust the
-        # cookie, log the correction.
-        mloc = re.search(r"_vinted_([a-z]{2})_session", " " + " ".join(cmap))
-        if mloc:
-            cookie_domain = f"www.vinted.{mloc.group(1)}"
-            if cookie_domain != requested_domain:
-                log(f"[{name}] domain corrected: cookies are for {cookie_domain} "
-                    f"(config said {requested_domain}) — using the cookie's domain")
-                VINTED_META[name] = {"domain": cookie_domain}
-            domain = cookie_domain
-        base = f"https://{domain}"
-        log(f"[{name}] poll domain: {domain} "
-            f"(config: {requested_domain or 'not set'}, cookies: {tmp_loc(cmap)})")
+        # NOTE: _vinted_fr_session is Vinted's CONSTANT internal cookie name on ALL
+        # country domains (fr = company legacy) — it does NOT indicate the domain.
+        log(f"[{name}] poll domain: {domain} (config: {requested_domain or 'not set'}, "
+            f"{len(cmap)} cookies)")
         refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
         if refreshed_raw:
             cookie_raw = refreshed_raw
