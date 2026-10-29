@@ -22,6 +22,7 @@
 #   python3 tracker.py --sample   # serve built-in sample data, no network
 
 import base64, json, os, re, sqlite3, sys, threading, time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -421,27 +422,73 @@ def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
             pass
     return raw_map, changed
 
-def vinted_refresh(base, ua, cookie_raw, csrf=""):
-    """POST /oauth/token (vinted-mcp verified shape). Returns (access_token, set_cookie_lines)."""
+def vinted_csrf(base, ua, cookie_raw, name):
+    """Harvest the csrf token the SPA pairs with its session: homepage meta tag
+    (cookies on some stacks carry csrf_token; ours doesn't)."""
+    try:
+        req = urllib.request.Request(base + "/", headers={"user-agent": ua or "Mozilla/5.0",
+                                                          "cookie": cookie_raw,
+                                                          "accept": "text/html,application/xhtml+xml,*/*"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", "replace")
+            setc = r.headers.get_all("Set-Cookie") or []
+        m = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+        token = m.group(1) if m else ""
+        log(f"[{name}] csrf harvest: {'ok' if token else 'TAG NOT FOUND'} "
+            f"(page {len(html)} chars, {len(setc)} set-cookies absorbed)")
+        return token, setc
+    except HTTPError as e:
+        log(f"[{name}] csrf harvest HTTP {e.code}")
+        return "", e.headers.get_all("Set-Cookie") or []
+    except Exception as e:
+        log(f"[{name}] csrf harvest failed: {type(e).__name__}")
+        return "", []
+
+def vinted_refresh(base, ua, cookie_raw, csrf="", name="", want_csrf=True):
+    """POST /oauth/token (vinted-mcp shape). Returns (access_token, set_cookie_lines).
+    Logs the failure body — that detail is the whole debug story."""
     cm = cookie_map(cookie_raw)
     rt = cm.get("refresh_token_web", "")
     if not rt:
+        log(f"[{name}] refresh: no refresh_token_web in cookie file")
         return None, []
-    req = urllib.request.Request(f"{base}/oauth/token",
-                                 data=json.dumps({"grant_type": "refresh_token",
-                                                  "refresh_token": rt}).encode(),
-                                 headers={"content-type": "application/json",
-                                          "accept": "application/json",
-                                          "user-agent": ua or "Mozilla/5.0",
-                                          "cookie": cookie_raw,
-                                          **({"x-csrf-token": csrf} if csrf else {})})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode()).get("access_token"), r.headers.get_all("Set-Cookie") or []
-    except HTTPError as e:
-        return None, e.headers.get_all("Set-Cookie") or []
-    except Exception:
-        return None, []
+    attempts = []
+    if csrf:
+        attempts.append(("application/json", {"grant_type": "refresh_token", "refresh_token": rt}))
+        attempts.append(("application/x-www-form-urlencoded",
+                         urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()))
+    else:
+        attempts.append(("application/json", {"grant_type": "refresh_token", "refresh_token": rt}))
+    for ctype, payload in attempts:
+        if isinstance(payload, dict):
+            data = json.dumps(payload).encode()
+        else:
+            data = payload
+        if ctype == "application/json" and csrf:
+            extra = {"x-csrf-token": csrf}
+        else:
+            extra = {}
+        req = urllib.request.Request(f"{base}/oauth/token", data=data,
+                                     headers={"content-type": ctype,
+                                              "accept": "application/json",
+                                              "user-agent": ua or "Mozilla/5.0",
+                                              "cookie": cookie_raw,
+                                              **extra})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                at = json.loads(r.read().decode()).get("access_token")
+                if at:
+                    log(f"[{name}] refresh OK ({ctype}, csrf={'yes' if csrf else 'no'})")
+                    return at, r.headers.get_all("Set-Cookie") or []
+                log(f"[{name}] refresh answered 200 without access_token ({ctype})")
+        except HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:200]
+            log(f"[{name}] refresh POST HTTP {e.code} ({ctype}, csrf={'yes' if csrf else 'no'}): {body}")
+            if e.code in (403, 429):
+                return None, e.headers.get_all("Set-Cookie") or []   # datadome/rate: stop, retry whole flow later w/ cookies from caller
+        except Exception as e:
+            log(f"[{name}] refresh error {type(e).__name__} ({ctype})")
+    return None, []
 
 VINTED_META: dict[str, dict] = {}
 
@@ -457,7 +504,10 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
     VINTED_META[name] = {"token": f"jwt exp in {mins} min", "refresh": bool(raw_map.get("refresh_token_web"))}
     if exp - time.time() > margin or not raw_map.get("refresh_token_web"):
         return None
-    access, setc = vinted_refresh(base, ua, cookie_header(raw_map))
+    csrf, home_setc = vinted_csrf(base, ua, cookie_header(raw_map), name)
+    if home_setc:
+        rotate_cookies(cookie_path, raw_map, home_setc)
+    access, setc = vinted_refresh(base, ua, cookie_header(raw_map), csrf, name=name)
     if not access:
         log(f"[{name}] proactive token refresh failed — keeping existing cookie set")
         return None
@@ -495,8 +545,12 @@ def fetch_state(acct):
     if code == 401 and not SAMPLE_MODE and cookie_raw:
         cmap = cookie_map(cookie_raw)
         if cmap.get("refresh_token_web"):
-            csrf = cmap.get("csrf_token") or cmap.get("_csrf_token") or ""
-            access, setc = vinted_refresh(base, ua, cookie_raw, csrf)
+            csrf, home_setc = vinted_csrf(base, ua, cookie_raw, name)
+            if home_setc:
+                rotate_cookies(cookie_path, cmap, home_setc)
+                cookie_raw = cookie_header(cmap)
+                setc_retry = None
+            access, setc = vinted_refresh(base, ua, cookie_raw, csrf, name=name)
             if access:
                 cmap["access_token_web"] = access
                 rotate_cookies(cookie_path, cmap, setc)
