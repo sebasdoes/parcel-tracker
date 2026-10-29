@@ -596,7 +596,9 @@ def fetch_state(acct):
         log(f"[{name}] users/current HTTP {code}; cookies on file: {cookie_names}")
         hint = "session cookie stale or wrong domain cookies"
         if code == 401:
-            hint = "session value stale/renamed — re-copy the FULL Cookie header from a logged-in page"
+            hint = ("refresh token rotated away by the account's OTHER sessions "
+                    "(or logged out). Fix: dedicated browser profile — log in once, "
+                    "copy its full Cookie header, never touch vinted in that profile again")
         return False, {"error": f"users/current HTTP {code}", "hint": hint}
     user = body.get("user") or body
     uid = user.get("id")
