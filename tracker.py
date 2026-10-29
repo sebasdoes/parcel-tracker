@@ -21,7 +21,7 @@
 #   python3 tracker.py            # normal operation (config.json)
 #   python3 tracker.py --sample   # serve built-in sample data, no network
 
-import json, os, re, sqlite3, sys, threading, time
+import base64, json, os, re, sqlite3, sys, threading, time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -263,6 +263,7 @@ BROWSER_HEADERS = {
 }
 
 def api_get(path, base, ua, cookie_raw=None, referer=None):
+    """Returns (status, body, set_cookie_lines) — the third is for cookie rotation."""
     url = f"{base}{path}"
     headers = {"user-agent": ua or "Mozilla/5.0",
                "referer": referer or f"{base}/",
@@ -272,12 +273,12 @@ def api_get(path, base, ua, cookie_raw=None, referer=None):
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read().decode())
+            return r.status, json.loads(r.read().decode()), r.headers.get_all("Set-Cookie") or []
     except HTTPError as e:
         body = e.read().decode("utf-8", "replace")
-        return e.code, {"__error__": body}
+        return e.code, {"__error__": body}, e.headers.get_all("Set-Cookie") or []
     except (URLError, TimeoutError, json.JSONDecodeError) as e:
-        return 0, {"__error__": str(e)}
+        return 0, {"__error__": str(e)}, []
 
 def is_datadome_block(code, body):
     return code == 403 or "datadome" in str(body.get("__error__", "")).lower() or \
@@ -372,6 +373,99 @@ def parse_transactions(payload):
         parsed.append(info)
     return parsed
 
+
+# ------------------------- vinted token refresh (auto) -------------------------
+
+def jwt_exp(token):
+    """exp (epoch seconds) from a JWT body, or None."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part)).get("exp")
+    except Exception:
+        return None
+
+def cookie_map(raw):
+    out = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        i = part.find("=")
+        if i > 0:
+            out[part[:i].strip()] = part[i + 1:].strip()
+    return out
+
+def cookie_header(d):
+    return "; ".join(f"{k}={v}" for k, v in d.items())
+
+def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
+    """Fold Set-Cookie rotations into the cookie map; rewrite the file if it changed."""
+    changed = False
+    for line in set_cookie_lines or []:
+        pair = line.split(";", 1)[0]
+        i = pair.find("=")
+        if i <= 0:
+            continue
+        name = pair[:i].strip()
+        value = pair[i + 1:].strip()
+        if name and value:
+            raw_map[name] = value          # wire-format value: keep verbatim
+            changed = True
+    if changed and cookie_path:
+        try:
+            open(cookie_path, "w").write(cookie_header(raw_map))
+            with COOKIE_LOCK:
+                _cookie_cache[cookie_path] = {"mtime": os.stat(cookie_path).st_mtime,
+                                              "raw": cookie_header(raw_map)}
+            log(f"cookies rotated on file ({cookie_path}): refreshed names")
+        except OSError:
+            pass
+    return raw_map, changed
+
+def vinted_refresh(base, ua, cookie_raw, csrf=""):
+    """POST /oauth/token (vinted-mcp verified shape). Returns (access_token, set_cookie_lines)."""
+    cm = cookie_map(cookie_raw)
+    rt = cm.get("refresh_token_web", "")
+    if not rt:
+        return None, []
+    req = urllib.request.Request(f"{base}/oauth/token",
+                                 data=json.dumps({"grant_type": "refresh_token",
+                                                  "refresh_token": rt}).encode(),
+                                 headers={"content-type": "application/json",
+                                          "accept": "application/json",
+                                          "user-agent": ua or "Mozilla/5.0",
+                                          "cookie": cookie_raw,
+                                          **({"x-csrf-token": csrf} if csrf else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode()).get("access_token"), r.headers.get_all("Set-Cookie") or []
+    except HTTPError as e:
+        return None, e.headers.get_all("Set-Cookie") or []
+    except Exception:
+        return None, []
+
+VINTED_META: dict[str, dict] = {}
+
+def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
+    """Proactive: refresh access_token_web when its JWT expires within REFRESH_MARGIN."""
+    at = raw_map.get("access_token_web", "")
+    exp = jwt_exp(at)
+    margin = 600
+    if exp is None:
+        VINTED_META[name] = {"token": "opaque (no exp)", "refresh": bool(raw_map.get("refresh_token_web"))}
+        return None
+    mins = int((exp - time.time()) / 60)
+    VINTED_META[name] = {"token": f"jwt exp in {mins} min", "refresh": bool(raw_map.get("refresh_token_web"))}
+    if exp - time.time() > margin or not raw_map.get("refresh_token_web"):
+        return None
+    access, setc = vinted_refresh(base, ua, cookie_header(raw_map))
+    if not access:
+        log(f"[{name}] proactive token refresh failed — keeping existing cookie set")
+        return None
+    raw_map["access_token_web"] = access
+    rotate_cookies(cookie_path, raw_map, setc)
+    log(f"[{name}] access_token_web proactively refreshed (was expiring in {mins} min)")
+    return cookie_header(raw_map)
+
 # ------------------------- poll loop -------------------------
 
 def fetch_state(acct):
@@ -387,13 +481,32 @@ def fetch_state(acct):
         if not cookie_raw:
             return False, {"error": f"cookies file missing/empty ({cookie_path})",
                            "hint": "copy cookies into data/ per config.json"}
-    code, body = api_get("/api/v2/users/current", base, ua, cookie_raw)
+        cmap = cookie_map(cookie_raw)
+        refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
+        if refreshed_raw:
+            cookie_raw = refreshed_raw
+    code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
+    if setc and cookie_raw:
+        cmap = cookie_map(cookie_raw)
+        rotate_cookies(cookie_path, cmap, setc)
+        cookie_raw = cookie_header(cmap)
     if is_datadome_block(code, body):
         return False, {"error": "datadome_challenge"}
+    if code == 401 and not SAMPLE_MODE and cookie_raw:
+        cmap = cookie_map(cookie_raw)
+        if cmap.get("refresh_token_web"):
+            csrf = cmap.get("csrf_token") or cmap.get("_csrf_token") or ""
+            access, setc = vinted_refresh(base, ua, cookie_raw, csrf)
+            if access:
+                cmap["access_token_web"] = access
+                rotate_cookies(cookie_path, cmap, setc)
+                cookie_raw = cookie_header(cmap)
+                code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
+                log(f"[{name}] recovered from 401 via refresh_token_web")
     if code != 200 or not isinstance(body.get("user", body), dict):
         # self-document the failure: response body snip + the cookie names
         # actually on the file (stale value or misnamed cookie show up instantly)
-        cookie_names = sorted({m.group(2) for m in re.finditer(r'(?:(^|;)\s*(?:)?)([A-Za-z0-9_.-]+)=', cookie_raw or "")})
+        cookie_names = sorted({m.group(1) for m in re.finditer(r'(?:^|;\s*)([A-Za-z0-9_.-]+)=', cookie_raw or "")})
         try:
             dump = {
                 "call": "users/current", "http": code,
@@ -419,8 +532,12 @@ def fetch_state(acct):
     # scoped (no uid in the URL). Referer matches the my_orders page.
     api_host = re.sub(r"^www\.", "", domain)
     escrow_base = f"https://api.{api_host}"
-    code, txp = api_get("/escrow-orders/api/v2/current-user/escrow-orders?page=1&per_page=20&type=purchased&status=in_progress",
-                        escrow_base, ua, cookie_raw, referer=f"{base}/my_orders?order_type=purchased")
+    code, txp, setc = api_get("/escrow-orders/api/v2/current-user/escrow-orders?page=1&per_page=20&type=purchased&status=in_progress",
+                              escrow_base, ua, cookie_raw, referer=f"{base}/my_orders?order_type=purchased")
+    if setc and cookie_raw:
+        cmap = cookie_map(cookie_raw)
+        rotate_cookies(cookie_path, cmap, setc)
+        cookie_raw = cookie_header(cmap)
     if is_datadome_block(code, txp):
         return False, {"error": "datadome_challenge"}
     try:
@@ -443,8 +560,12 @@ def fetch_state(acct):
             continue
         hosts = [host_cache] if host_cache else [base, f"https://api.{api_host}"]   # journey lives on www (verified)
         for host in hosts:
-            jcode, jbody = api_get(f"/api/v2/transactions/{oid}/shipment/journey_summary", host, ua, cookie_raw,
-                                   referer=f"{base}/my_orders?order_type=purchased")
+            jcode, jbody, jsetc = api_get(f"/api/v2/transactions/{oid}/shipment/journey_summary", host, ua, cookie_raw,
+                                          referer=f"{base}/my_orders?order_type=purchased")
+            if jsetc and cookie_raw:
+                cmap = cookie_map(cookie_raw)
+                rotate_cookies(cookie_path, cmap, jsetc)
+                cookie_raw = cookie_header(cmap)
             if jcode == 200 and isinstance(jbody, dict) and not jbody.get("__error__"):
                 _journey_host_cache[name] = host if not host_cache else host_cache
                 merge_journey(t, jbody)
@@ -603,7 +724,8 @@ def poll_once():
     for source, account, fetch, key in active_sources():
         try:
             txs = fetch()
-            sources_state[key] = {"ok": True, "count": len(txs)}
+            sources_state[key] = {"ok": True, "count": len(txs),
+                                  **VINTED_META.get(account, {})}
         except postnl_mod.InvalidCredentials as e:
             sources_state[key] = {"ok": False, "error": "bad_credentials", "detail": str(e)[:120]}
             log("PostNL rejected credentials — ACTION: fix the account's email/password in config.json")
