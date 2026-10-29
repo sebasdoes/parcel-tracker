@@ -399,7 +399,10 @@ def cookie_header(d):
     return "; ".join(f"{k}={v}" for k, v in d.items())
 
 def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
-    """Fold Set-Cookie rotations into the cookie map; rewrite the file if it changed."""
+    """Fold Set-Cookie rotations into the cookie map; rewrite the file if it changed.
+    NON-destructive: values that are empty (name= with Max-Age=0/Expires=past → the
+    server DELETING a cookie) are ignored — a stale value beats a wiped one (the
+    first production round-trip wiped access_token_web this way, 3513 -> 2550 chars)."""
     changed = False
     for line in set_cookie_lines or []:
         pair = line.split(";", 1)[0]
@@ -444,6 +447,8 @@ def vinted_csrf(base, ua, cookie_raw, name):
     except Exception as e:
         log(f"[{name}] csrf harvest failed: {type(e).__name__}")
         return "", []
+
+VINTED_META: dict[str, dict] = {}
 
 CLIENT_CANDIDATES = ("web", "ios", "android", "bff", "spa", "app", "vinted", "public")
 
@@ -530,8 +535,9 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
 
 def fetch_state(acct):
     """returns (ok, data) — data carries user id + parsed transactions."""
-    requested_domain = acct.get("domain")            # may be None — inference decides
+    requested_domain = acct.get("domain")            # may be None — inference-less flow
     domain = requested_domain or "www.vinted.nl"
+    base = f"https://{domain}"
     ua = acct.get("user_agent") or os.environ.get("USER_AGENT", "")
     name = acct.get("name") or "main"
     cookie_raw = None
