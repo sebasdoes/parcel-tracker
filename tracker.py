@@ -422,6 +422,11 @@ def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
             pass
     return raw_map, changed
 
+
+def tmp_loc(cmap):
+    m = re.search(r"_vinted_([a-z]{2})_session", " " + " ".join(cmap))
+    return f"home={m.group(1)}" if m else "no session-cookie domain hint"
+
 def vinted_csrf(base, ua, cookie_raw, name):
     """Harvest the csrf token the SPA pairs with its session: homepage meta tag
     (cookies on some stacks carry csrf_token; ours doesn't)."""
@@ -545,6 +550,8 @@ def fetch_state(acct):
                 VINTED_META[name] = {"domain": cookie_domain}
             domain = cookie_domain
         base = f"https://{domain}"
+        log(f"[{name}] poll domain: {domain} (config: {requested_domain}, "
+            f"cookies: {tmp_loc(cmap)})")
         refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
         if refreshed_raw:
             cookie_raw = refreshed_raw
