@@ -725,6 +725,86 @@ def fetch_vinted(acct) -> list:
         t.setdefault("track", None)
     return data["transactions"]
 
+# ------------------------- bol source (GraphQL persisted ops) -------------------------
+
+BOL_OPS = "https://www.bol.com/api/graphql"
+BOL_META = "https://www.bol.com"   # item detail urls are relative to this
+
+BOL_OVERVIEW = {"operationName": "CsAccountOrdersOverviewClient",
+                "variables": {"after": "0"},
+                "extensions": {"persistedQuery": {
+                    "sha256Hash": "sha256:8b5eed70df09545fe331e288c5f12b58af210a5c0ec6a85f782ba0af645791b7",
+                    "version": 1}}}
+
+def _bol_graph(payload, ua, cookie_raw, timeout=30):
+    req = urllib.request.Request(BOL_OPS, data=json.dumps(payload).encode(),
+                                 headers={"content-type": "application/json",
+                                          "accept": "application/json",
+                                          "user-agent": ua or "Mozilla/5.0",
+                                          "cookie": cookie_raw})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except HTTPError as e:
+        return e.code, {"__error__": e.read().decode("utf-8", "replace")}
+    except Exception as e:
+        return 0, {"__error__": str(e)}
+
+def parse_bol_orders(payload, name):
+    """data.me.orders[] -> per-ITEM rows (items ship as separate units)."""
+    orders = (((payload or {}).get("data") or {}).get("me") or {}).get("orders") or []
+    rows = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        created = o.get("creationDateTime")
+        for it in o.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            off = it.get("offerInformation") or {}
+            title = off.get("productTitle") or it.get("productTitle") or ""
+            status = (it.get("status") or {}).get("shortTranslatedStatus") or ""
+            ret = (off.get("retailer") or {}).get("name") or "bol"
+            url = it.get("url") or ""
+            rows.append({"source": "bol", "account": name,
+                         "order_id": str(it.get("id") or f"{o.get('reference')}-?"),
+                         "role": "in", "title": title, "state": status,
+                         "updated_at": created,
+                         "pickup": {"retailer": ret} if ret else {},
+                         "deadline": None,
+                         "track": (BOL_META + url) if url else None,
+                         "raw": it})
+    return rows
+
+def fetch_bol(acct) -> list:
+    name = acct.get("name") or "main"
+    if SAMPLE_MODE:
+        path = os.path.join(os.path.dirname(__file__) or ".", "sample", "bol.json")
+        rows = json.load(open(path))
+        for t in rows:
+            t["source"] = "bol"; t["account"] = name
+        return rows
+    if not acct.get("cookies_file"):
+        raise RuntimeError("bol account misconfigured: cookies_file needed")
+    cookie_path = os.path.join(DATA_DIR, acct["cookies_file"])
+    cookie_raw = load_cookies(cookie_path)
+    if not cookie_raw:
+        raise RuntimeError(f"cookies file missing/empty ({cookie_path})")
+    code, payload = _bol_graph(BOL_OVERVIEW, acct.get("user_agent"), cookie_raw)
+    try:
+        open(os.path.join(DATA_DIR, f"txraw_bol_{name}.json"), "w").write(
+            json.dumps({"http": code, "payload": payload}, indent=1, default=str))
+    except OSError:
+        pass
+    if code != 200:
+        raise RuntimeError(f"bol graphql HTTP {code}: {str(payload)[:160]}")
+    if payload.get("errors"):
+        raise RuntimeError(f"bol graphql errors: {json.dumps(payload['errors'])[:200]}")
+    rows = parse_bol_orders(payload, name)
+    for t in rows:
+        t.setdefault("track", None); t.setdefault("role", "in")
+    return rows
+
 # ------------------------- postnl source -------------------------
 
 def postnl_token_path(account):
@@ -792,6 +872,9 @@ def active_sources():
     for acct in acct_list("postnl"):
         name = acct.get("name") or "main"
         out.append(("postnl", name, lambda a=acct: fetch_postnl(a), f"postnl/{name}"))
+    for acct in acct_list("bol"):
+        name = acct.get("name") or "main"
+        out.append(("bol", name, lambda a=acct: fetch_bol(a), f"bol/{name}"))
     return out
 
 def poll_once():
@@ -940,6 +1023,7 @@ document.querySelectorAll('.modal').forEach(function (m) {
 
 def p_class(state):
     s = (state or "").lower()
+    if "wordt" in s and "bezorgd" in s: return "transit"   # 'Wordt (vandaag) bezorgd' = underway
     if any(x in s for x in ("bezorgd", "afgeleverd", "ontvangen", "complete")): return "done"
     if ("pick" in s and ("up" in s or "ready" in s)) or "klaar" in s or "punt" in s: return "wait"
     if any(x in s for x in ("received", "picked", "success")): return "done"
@@ -956,7 +1040,7 @@ def is_waiting(state, role):
     s = (state or "").lower()
     return role == "in" and s and any(x in s for x in
         ("pick up", "pickup", "pick-up", "punt", "point", "ready to",
-         "wait_for_receiver", "at_pickup", "klaar"))
+         "wait_for_receiver", "at_pickup", "klaar", "wordt vandaag"))
 
 def store_row(info):
     """JSON for the transactions.data column — the normalized dict itself."""
@@ -1153,8 +1237,14 @@ def seed_sample():
     for t in postnl_tx:
         t["account"] = t.get("account") or "main"
     parsed.extend(postnl_tx)
+    bpath = os.path.join(os.path.dirname(__file__) or ".", "sample", "bol.json")
+    bol_tx = json.load(open(bpath))
+    for t in bol_tx:
+        t["account"] = t.get("account") or "main"
+    parsed.extend(bol_tx)
     sources_state = {"vinted/main": {"ok": True, "count": len(vinted)},
-                     "postnl/main": {"ok": True, "count": len(postnl_tx)}}
+                     "postnl/main": {"ok": True, "count": len(postnl_tx)},
+                     "bol/main": {"ok": True, "count": len(bol_tx)}}
     seen = time.time()
     with db() as con:
         for t in parsed:
