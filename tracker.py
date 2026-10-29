@@ -248,6 +248,8 @@ def load_cookies(path):
             pairs = d.get("cookies", d)
             raw = "; ".join(f"{k}={v}" for k, v in pairs.items())
         else:
+            if txt.lower().startswith("cookie:"):
+                txt = txt[7:].strip()      # tolerate a pasted 'Cookie: <header>' whole line
             raw = txt                      # raw header string
         _cookie_cache[path] = {"mtime": mtime, "raw": raw}
         log(f"cookies reloaded for {os.path.basename(path)} ({len(raw)} chars)")
