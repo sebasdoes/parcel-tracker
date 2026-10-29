@@ -290,7 +290,7 @@ def is_datadome_block(code, body):
 
 # ------------------------- parsing -------------------------
 
-DEADLINE_KEY_RE = re.compile(r'(expir|until_|_until$|_until\b|deadline|pickup_at|pick_up_at)', re.I)
+DEADLINE_KEY_RE = re.compile(r'(expir|until|deadline|pickup_at|pick_up_at|afhaal|bezorger|delivery_date)', re.I)
 PICKUP_HINT_RE  = re.compile(r'(pick[_ ]?up|parcel[_ ]shop|locker|punt\b|point)', re.I)
 
 def walk_json(node, path="", out=None):
@@ -724,7 +724,7 @@ def merge_journey(t, jbody):
     details = j.get("details") or []
     last = details[-1] if details and isinstance(details[-1], dict) else {}
     if last.get("message"):
-        t["pickup"]["last"] = str(last["message"])[:90]
+        t["event"] = str(last["message"])[:140]   # carrier event text — NOT a location
     est = j.get("estimated_detail") or {}
     if est.get("time_period") and not t.get("deadline"):
         t["deadline"] = f"{est.get('status') or 'ETA'}: {est['time_period']}"
@@ -1241,9 +1241,11 @@ def render_transactions(rows, heading, note=""):
         acct = (t.get("account") or "").strip()
         if acct and acct != "main":
             src = f"{src}/{acct}"
+        where = "; ".join(str(v) for k, v in (t.get("pickup") or {}).items()
+                          if v and k not in ("last", "ev"))
         out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
-                f"<td class='muted'>{'; '.join(str(v) for v in (t.get('pickup') or {}).values() if v) or '—'}</td>"
+                f"<td class='muted'>{where or '—'}</td>"
                 f"<td{until_attr}>{until_plain or '—'}</td></tr>")
     return out + "</table></div>"
 
