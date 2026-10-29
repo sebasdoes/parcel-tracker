@@ -691,7 +691,7 @@ def fetch_state(acct):
                     pass
                 merge_journey(t, jbody)
                 if not t.get("pickup", {}).get("point"):
-                    pt = fetch_shipment_point(host, ua, cookie_raw, referer, oid, name)
+                    pt = fetch_shipment_point(host, ua, cookie_raw, f"{base}/my_orders?order_type=purchased", oid, name)
                     if pt:
                         t["pickup"]["point"] = pt[0]
                         if pt[1]:
