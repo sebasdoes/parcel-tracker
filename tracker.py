@@ -1365,7 +1365,11 @@ def render_transactions(rows, heading, note="", since_label=False):
             until_iso, until_plain = since_m.group(1), (rel_time(since_m.group(1)) or since_m.group(1)[:16].replace("T", " "))
         else:
             until_iso, until_plain = until_display(deadline)
-        until_attr = f' data-until="{until_iso}" data-show="{until_iso[:10]}"' if until_iso else ""
+        if since_m:   # 'Since' cell: static relative text + hover ISO; no countdown
+            until_attr = f' title="{esc(until_iso)}"'
+        else:
+            until_attr = (f' data-until="{until_iso}" data-show="{until_iso[:10]}"'
+                          + (f' title="{esc(until_iso)}"' if until_iso else "")) if until_iso else ""
         title = t.get("title") or ""
         if t.get("track"):
             title = f"<a href='{t['track']}'>{title}</a>"
@@ -1386,7 +1390,7 @@ def render_transactions(rows, heading, note="", since_label=False):
         out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{where or '—'}</td>"
-                f"<td{until_attr + (f' title=\"{esc(until_iso)}\"' if until_iso else '')}>{((rel_time(until_iso) or until_plain) if until_iso else until_plain or '—') + retention_note(t)}</td></tr>")
+                f"<td{until_attr}>{((rel_time(until_iso) or until_plain) if until_iso else until_plain or '—') + retention_note(t)}</td></tr>")
     return out + "</table></div>"
 
 def render_history(con):
