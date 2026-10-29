@@ -658,7 +658,7 @@ STYLE = """/* vinted tracker ui */
 :root { color-scheme: dark; }
 body { background:#0d1117; color:#e6edf3; font:15px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;
        margin:0; padding:24px; max-width:900px; margin-inline:auto; }
-h1 { font-size:1.35em; letter-spacing:.3px; display:flex; gap:10px; align-items:center; }
+h1 { font-size:1.35em; letter-spacing:.3px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 h1 .dot { width:9px;height:9px;border-radius:50%;background:#3fb950; box-shadow:0 0 6px #3fb9;}
 h1 .dot.stale { background:#d29922; box-shadow:0 0 6px #d29922; }
 h2 { font-size:.95em; color:#8b949e; text-transform:uppercase; letter-spacing:.14em; margin:26px 0 8px; }
@@ -684,13 +684,22 @@ tr:last-child td { border-bottom:none; }
 .badge.bad { border-color:rgba(248,81,73,.5); }
 .modal { position:fixed; inset:0; background:rgba(1,4,9,.72); display:none; z-index:10; }
 .modal.open { display:block; }
-.modal .box { background:#161b22; border:1px solid #30363d; border-radius:10px; max-width:560px;
-              margin:9vh auto; padding:16px 22px 10px; }
+.modal .box { background:#161b22; border:1px solid #30363d; border-radius:10px; max-width:min(560px, calc(100vw - 20px));
+              margin:6vh auto; padding:16px 22px 10px; }
+.tablewrap { overflow-x:auto; }
+@media (max-width: 600px) {
+  body { padding:12px; }
+  h1 { font-size:1.1em; gap:8px; }
+  th { padding:7px 8px; }
+  td { padding:7px 8px; }
+  .modal .box { padding:12px 14px 8px; }
+  td .muted { word-break:break-all; }
+}
 .modal h3 { margin:0 0 10px; font-size:1em; }
 .modal .acct { padding:9px 0; border-bottom:1px solid #21262d; font-size:.9em; }
 .modal .acct:last-child { border-bottom:none; }
 .modal .acct .name { font-weight:600; }
-.modal .acct .ok { color:#3fb950; font-size:.82em; margin-left:10px; }
+.modal .acct .ok { color:#3fb950; font-size:.82em; margin:0 10px; }
 .modal .acct .err { color:#f85149; font-size:.85em; display:block; white-space:pre-wrap; }
 .modal .muted-note { color:#8b949e; font-size:.78em; margin-top:10px; }
 .deadline { color:#e3b341; font-weight:600; }
@@ -804,7 +813,7 @@ def render_transactions(rows, heading, note=""):
     if not rows:
         out += f'<p class="muted">{note or "none"}</p>'
         return out
-    out += "<table><tr><th>Item</th><th>Status</th><th>Where</th><th>Until</th></tr>"
+    out += "<div class='tablewrap'><table><tr><th>Item</th><th>Status</th><th>Where</th><th>Until</th></tr>"
     for t in rows:
         until_iso, until_plain = until_display(t.get("deadline"))
         until_attr = f' data-until="{until_iso}" data-show="{until_iso[:10]}"' if until_iso else ""
@@ -815,12 +824,11 @@ def render_transactions(rows, heading, note=""):
         acct = (t.get("account") or "").strip()
         if acct and acct != "main":
             src = f"{src}/{acct}"
-        out += (f"<tr><td>{title}<div class='muted'>{t.get('order_id','')}</div></td>"
+        out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{'; '.join(str(v) for v in (t.get('pickup') or {}).values() if v) or '—'}</td>"
-                f"<td{until_attr}>{until_plain or '—'}</td>"
-                f"<td><span class='src'>{src}</span></td></tr>")
-    return out + "</table>"
+                f"<td{until_attr}>{until_plain or '—'}</td></tr>")
+    return out + "</table></div>"
 
 def render_history(con):
     if "account" in [r[1] for r in con.execute("PRAGMA table_info(events)")]:
