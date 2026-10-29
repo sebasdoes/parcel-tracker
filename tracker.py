@@ -420,7 +420,10 @@ def rotate_cookies(cookie_path, raw_map, set_cookie_lines):
             with COOKIE_LOCK:
                 _cookie_cache[cookie_path] = {"mtime": os.stat(cookie_path).st_mtime,
                                               "raw": cookie_header(raw_map)}
-            log(f"cookies rotated on file ({cookie_path}): refreshed names")
+            now = time.time()
+            if now - _rotation_log_at.get(cookie_path, 0) > 600:
+                _rotation_log_at[cookie_path] = now
+                log(f"cookies rotated on file ({cookie_path}): refreshed names")
         except OSError:
             pass
     return raw_map, changed
@@ -449,6 +452,7 @@ def vinted_csrf(base, ua, cookie_raw, name):
         return "", []
 
 VINTED_META: dict[str, dict] = {}
+_rotation_log_at: dict[str, float] = {}
 
 CLIENT_CANDIDATES = ("web", "ios", "android", "bff", "spa", "app", "vinted", "public")
 
