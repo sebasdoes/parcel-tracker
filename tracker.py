@@ -495,7 +495,10 @@ def fetch_vinted(acct) -> list:
         return txs
     ok, data = fetch_state(acct)
     if not ok:
-        raise RuntimeError(data.get("error", "unknown"))
+        msg = data.get("error", "unknown")
+        if data.get("hint"):
+            msg += f" — {data['hint']}"
+        raise RuntimeError(msg)
     for t in data["transactions"]:
         t["source"] = "vinted"
         t["account"] = acct.get("name") or "main"
@@ -589,7 +592,8 @@ def poll_once():
             log("PostNL rejected credentials — ACTION: fix the account's email/password in config.json")
             continue
         except Exception as e:
-            sources_state[key] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:140]}"}
+            sources_state[key] = {"ok": False,
+                                  "error": f"{type(e).__name__}: {str(e)[:400]}"}
             log(f"source {key} failed: {sources_state[key]['error']}")
             if "datadome" in str(type(e).__name__) + str(e):
                 log("ACTION: copy fresh cookies (session + datadome) into the account's cookies file")
@@ -656,6 +660,22 @@ tr:last-child td { border-bottom:none; }
 .rdot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:5px; }
 .rdot.bad { background:#f85149; }
 .muted { color:#8b949e; font-size:.85em; }
+.badge { display:inline-flex; align-items:center; gap:6px; margin-left:10px; background:#161b22;
+         border:1px solid #30363d; border-radius:20px; padding:2px 10px; font-size:.62em;
+         color:#e6edf3; cursor:pointer; }
+.badge.rdot { margin-right:0; }
+.badge.bad { border-color:rgba(248,81,73,.5); }
+.modal { position:fixed; inset:0; background:rgba(1,4,9,.72); display:none; z-index:10; }
+.modal.open { display:block; }
+.modal .box { background:#161b22; border:1px solid #30363d; border-radius:10px; max-width:560px;
+              margin:9vh auto; padding:16px 22px 10px; }
+.modal h3 { margin:0 0 10px; font-size:1em; }
+.modal .acct { padding:9px 0; border-bottom:1px solid #21262d; font-size:.9em; }
+.modal .acct:last-child { border-bottom:none; }
+.modal .acct .name { font-weight:600; }
+.modal .acct .ok { color:#3fb950; font-size:.82em; margin-left:10px; }
+.modal .acct .err { color:#f85149; font-size:.85em; display:block; white-space:pre-wrap; }
+.modal .muted-note { color:#8b949e; font-size:.78em; margin-top:10px; }
 .deadline { color:#e3b341; font-weight:600; }
 .deadline.soon { color:#f85149; }
 .refreshed { color:#8b949e; font-size:.78em; margin-top:10px; }
@@ -676,7 +696,18 @@ function tick() {
   });
 }
 setInterval(tick, 60000); tick();
-"""
+
+// service badges -> account modal
+document.querySelectorAll('.badge[data-service]').forEach(function (b) {
+  b.addEventListener('click', function () {
+    document.getElementById('modal-' + b.dataset.service).classList.add('open');
+  });
+});
+document.querySelectorAll('.modal').forEach(function (m) {
+  m.addEventListener('click', function () { m.classList.remove('open'); });
+  var box = m.querySelector('.box');
+  if (box) box.addEventListener('click', function (e) { e.stopPropagation(); });
+});"""
 
 def p_class(state):
     s = (state or "").lower()
@@ -795,11 +826,32 @@ def build_page():
         last_seen = max((t["seen_at"] for t in rows), default=None)
         hist = render_history(con)
     srcs = read_snapshot_sources()
-    src_dots = ""
-    for name, st in srcs.items():
-        cls = "" if st.get("ok") else "bad"
-        label = name if st.get("ok") else f"{name} ⚠ {st.get('error','')[:28]}"
-        src_dots += f"<span class='srcline'><span class='rdot {cls}'></span>{label}</span>"
+    svc: dict[str, dict] = {}   # service -> {account: state}
+
+    for key, st in srcs.items():
+        s, _, a = key.partition("/")
+        svc.setdefault(s, {})[a or "main"] = st
+    btn_badges, modals_html = "", ""
+    for s in sorted(svc):
+        accounts = svc[s]
+        bad = any(not st.get("ok") for st in accounts.values())
+        cls = "bad" if bad else ""
+        btn_badges += (f"<button class='badge {cls}' data-service='{s}'><span class='rdot {cls}'></span>{s}</button>")
+        acct_rows = ""
+        for a, st in sorted(accounts.items()):
+            if st.get("ok"):
+                acct_rows += (f"<div class='acct'><span class='name'>{a}</span>"
+                              f"<span class='ok'>ok</span><span class='muted'>{st.get('count', '?')} parcels</span></div>")
+            else:
+                acct_rows += (f"<div class='acct'><span class='name'>{a}</span>"
+                              f"<span class='ok' style='color:#f85149'>error</span>"
+                              f"<div class='err'>{st.get('error', 'unknown')}</div></div>")
+        modals_html += (f"<div class='modal' id='modal-{s}'><div class='box'>"
+                   f"<h3>{s} — account status</h3>{acct_rows}"
+                   f"<div class='muted-note'>last poll: "
+                   + (time.strftime("%H:%M", time.localtime(last_seen)) if last_seen else "never")
+                   + f" · next check within {poll_seconds() // 60} min"
+                   + " · click anywhere outside to close</div></div></div>")
     fresh = [t for t in rows if time.time() - t["seen_at"] < poll_seconds() * 3]
     waiting = [t for t in fresh if is_waiting(t.get("state"), t.get("role", "in"))]
     others  = [t for t in fresh if t not in waiting]
@@ -809,7 +861,8 @@ def build_page():
         others_note = "nothing yet"
     else:
         others_note = ""
-    body = (f"<h1><span class='dot {dot}'></span> Parcels {src_dots}</h1>"
+    body = (f"<h1><span class='dot {dot}'></span> Parcels {btn_badges}</h1>"
+            + modals_html
             + render_transactions(waiting, "Awaiting pick-up", others_note or "nothing waiting")
             + render_transactions(others, "Everything else", "nothing yet")
             + hist
