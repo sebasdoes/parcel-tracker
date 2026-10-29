@@ -480,7 +480,7 @@ def vinted_refresh(base, ua, cookie_raw, csrf="", name=""):
     rt = cm.get("refresh_token_web", "")
     if not rt:
         log(f"[{name}] refresh: no refresh_token_web in cookie file")
-        return None, []
+        return None, [], {}
     saved = _saved_client(name)
     candidates = ([saved] if saved else []) + [c for c in CLIENT_CANDIDATES if c != saved]
     for cid in candidates:
@@ -494,12 +494,15 @@ def vinted_refresh(base, ua, cookie_raw, csrf="", name=""):
                                               **({"x-csrf-token": csrf} if csrf else {})})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                at = json.loads(r.read().decode()).get("access_token")
+                body = json.loads(r.read().decode())
+                at = body.get("access_token")
                 if at:
                     _save_client(name, cid)
                     if cid != saved:
                         log(f"[{name}] refresh OK with client_id={cid!r} (saved for future polls)")
-                    return at, r.headers.get_all("Set-Cookie") or []
+                    # oauth rotates the refresh token IN THE BODY (single-use grants):
+                    # fold it, or the next poll's refresh burns a dead token
+                    return at, r.headers.get_all("Set-Cookie") or [], body
                 log(f"[{name}] refresh 200-no-token with client_id={cid!r}")
         except HTTPError as e:
             body = e.read().decode("utf-8", "replace")[:160]
@@ -508,11 +511,24 @@ def vinted_refresh(base, ua, cookie_raw, csrf="", name=""):
                 log(f"[{name}] refresh: client_id={cid!r} -> rejected ({body})")   # try next candidate
             else:
                 log(f"[{name}] refresh POST HTTP {code} (client_id={cid!r}): {body}")
-                return None, e.headers.get_all("Set-Cookie") or []   # datadome/rate/network: stop
+                return None, e.headers.get_all("Set-Cookie") or [], {}   # datadome/rate: stop
         except Exception as e:
             log(f"[{name}] refresh error {type(e).__name__} (client_id={cid!r})")
-    return None, []
+    return None, [], {}
 
+
+def _fold_refresh_tokens(raw_map, body):
+    """oauth/token body carries the rotated refresh token: fold BOTH tokens into the
+    cookie map; single-use RTs die otherwise (prod-learned 2026-10-29)."""
+    if not isinstance(body, dict):
+        return False
+    changed = False
+    for k_src, k_dst in (("refresh_token", "refresh_token_web"),
+                         ("access_token", "access_token_web")):
+        if body.get(k_src):
+            raw_map[k_dst] = body[k_src]
+            changed = True
+    return changed
 
 def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
     """Proactive: refresh access_token_web when its JWT expires within REFRESH_MARGIN."""
@@ -529,12 +545,20 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
     csrf, home_setc = vinted_csrf(base, ua, cookie_header(raw_map), name)
     if home_setc:
         rotate_cookies(cookie_path, raw_map, home_setc)
-    access, setc = vinted_refresh(base, ua, cookie_header(raw_map), csrf, name=name)
+    access, setc, body = vinted_refresh(base, ua, cookie_header(raw_map), csrf, name=name)
     if not access:
         log(f"[{name}] proactive token refresh failed — keeping existing cookie set")
         return None
     raw_map["access_token_web"] = access
+    rotated = _fold_refresh_tokens(raw_map, body)
     rotate_cookies(cookie_path, raw_map, setc)
+    if rotated:
+        # persist the rotated RT at once (the map is rebuilt from the file each poll)
+        open(cookie_path, "w").write(cookie_header(raw_map))
+        with COOKIE_LOCK:
+            if cookie_path in _cookie_cache:
+                _cookie_cache[cookie_path]["raw"] = cookie_header(raw_map)
+        log(f"[{name}] refresh_token rotated on file (single-use grant kept alive)")
     log(f"[{name}] access_token_web proactively refreshed (was expiring in {mins} min)")
     return cookie_header(raw_map)
 
@@ -578,10 +602,17 @@ def fetch_state(acct):
                 rotate_cookies(cookie_path, cmap, home_setc)
                 cookie_raw = cookie_header(cmap)
                 setc_retry = None
-            access, setc = vinted_refresh(base, ua, cookie_raw, csrf, name=name)
+            access, setc, body = vinted_refresh(base, ua, cookie_raw, csrf, name=name)
             if access:
                 cmap["access_token_web"] = access
+                rotated = _fold_refresh_tokens(cmap, body)
                 rotate_cookies(cookie_path, cmap, setc)
+                if rotated:
+                    open(cookie_path, "w").write(cookie_header(cmap))
+                    with COOKIE_LOCK:
+                        if cookie_path in _cookie_cache:
+                            _cookie_cache[cookie_path]["raw"] = cookie_header(cmap)
+                    log(f"[{name}] refresh_token rotated on file (single-use grant kept alive)")
                 cookie_raw = cookie_header(cmap)
                 code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
                 log(f"[{name}] recovered from 401 via refresh_token_web")
