@@ -525,8 +525,8 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
 
 def fetch_state(acct):
     """returns (ok, data) — data carries user id + parsed transactions."""
-    requested_domain = acct.get("domain") or "www.vinted.nl"
-    domain = requested_domain
+    requested_domain = acct.get("domain")            # may be None — inference decides
+    domain = requested_domain or "www.vinted.nl"
     ua = acct.get("user_agent") or os.environ.get("USER_AGENT", "")
     name = acct.get("name") or "main"
     cookie_raw = None
@@ -550,8 +550,8 @@ def fetch_state(acct):
                 VINTED_META[name] = {"domain": cookie_domain}
             domain = cookie_domain
         base = f"https://{domain}"
-        log(f"[{name}] poll domain: {domain} (config: {requested_domain}, "
-            f"cookies: {tmp_loc(cmap)})")
+        log(f"[{name}] poll domain: {domain} "
+            f"(config: {requested_domain or 'not set'}, cookies: {tmp_loc(cmap)})")
         refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
         if refreshed_raw:
             cookie_raw = refreshed_raw
