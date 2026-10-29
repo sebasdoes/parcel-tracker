@@ -873,7 +873,7 @@ def build_page():
             '<meta name=viewport content="width=device-width,initial-scale=1">'
             '<meta http-equiv="refresh" content="60">'
             f"<title>Parcels</title><style>{STYLE}</style>"
-            f"<script>{JS_COUNTDOWN}</script></head><body>{body}</body></html>")
+            f"</head><body>{body}<script>{JS_COUNTDOWN}</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, ctype, body, cache=False):
