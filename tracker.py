@@ -690,6 +690,12 @@ def fetch_state(acct):
                 except OSError:
                     pass
                 merge_journey(t, jbody)
+                if not t.get("pickup", {}).get("point"):
+                    pt = fetch_shipment_point(host, ua, cookie_raw, referer, oid, name)
+                    if pt:
+                        t["pickup"]["point"] = pt[0]
+                        if pt[1]:
+                            t["pickup"]["point_url"] = GMAPS + urllib.parse.quote(pt[1])
                 break
             if is_datadome_block(jcode, jbody):
                 break
@@ -697,6 +703,23 @@ def fetch_state(acct):
     return True, {"user_id": uid, "transactions": parsed}
 
 _journey_host_cache: dict[str, str] = {}
+
+GMAPS = "https://www.google.com/maps/search/?api=1&query="
+
+def fetch_shipment_point(host, ua, cookie_raw, referer, escrow_id, name):
+    """GET /api/v2/escrow_orders/<id>/shipment (user-verified): carries the pick-up
+    point even when journey_summary is all-null. Returns (name, address) or None."""
+    code, body, setc = api_get(f"/api/v2/escrow_orders/{escrow_id}/shipment", host, ua, cookie_raw,
+                               referer=referer)
+    if code == 200 and isinstance(body, dict) and body.get("pickup_point_name"):
+        try:
+            open(os.path.join(DATA_DIR, f"txraw_shipment_{name}_{escrow_id}.json"), "w").write(
+                json.dumps(body, indent=1, default=str))
+        except OSError:
+            pass
+        return (str(body["pickup_point_name"])[:100],
+                str(body.get("pickup_point_address") or "")[:160])
+    return None
 
 PICKUP_DICT_RE = re.compile(r'(pick[_ ]?up(_point)?|pick_up|parcel_shop|parcelshop)', re.I)
 
@@ -728,12 +751,20 @@ def merge_journey(t, jbody):
     if cc.get("tracking_url"):
         t["track"] = cc["tracking_url"]
     details = j.get("details") or []
-    last = details[-1] if details and isinstance(details[-1], dict) else {}
+    last = details[0] if details and isinstance(details[0], dict) else {}   # details are NEWEST-FIRST
     if last.get("message"):
         t["event"] = str(last["message"])[:140]   # carrier event text — NOT a location
     est = j.get("estimated_detail") or {}
     if est.get("time_period") and not t.get("deadline"):
         t["deadline"] = f"{est.get('status') or 'ETA'}: {est['time_period']}"
+    # no ETA (typical at-pickup journeys): 'delivery time' = when it landed at the point
+    if not t.get("deadline"):
+        for d in details:
+            if isinstance(d, dict) and d.get("timestamp") and (
+                    str(d.get("status")) in ("available_for_pickup", "delivered", "at_pickup_point")
+                    or (d.get("cell_type") == "IN_PROGRESS")):
+                t["deadline"] = f"sinds {str(d['timestamp'])[:16]}"
+                break
     for d in details:
         di = d.get("delivery_information")
         if isinstance(di, dict):
@@ -1281,8 +1312,16 @@ def render_transactions(rows, heading, note=""):
         acct = (t.get("account") or "").strip()
         if acct and acct != "main":
             src = f"{src}/{acct}"
-        where = "; ".join(str(v) for k, v in (t.get("pickup") or {}).items()
-                          if v and k not in ("last", "ev"))
+        pk = t.get("pickup") or {}
+        point, purl = pk.get("point") or "", pk.get("point_url") or ""
+        parts = []
+        if point and purl:
+            parts.append(f"<a href='{purl}'>{point}</a>")
+        elif point:
+            parts.append(point)
+        parts += [str(v) for k, v in pk.items()
+                  if v and k not in ("last", "ev", "point", "point_url")]
+        where = "; ".join(parts)
         out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{where or '—'}</td>"
