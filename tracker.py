@@ -292,6 +292,7 @@ def is_datadome_block(code, body):
 
 DEADLINE_KEY_RE = re.compile(r'(expir|until|deadline|pickup_at|pick_up_at|afhaal|bezorger|delivery_date)', re.I)
 PICKUP_HINT_RE  = re.compile(r'(pick[_ ]?up|parcel[_ ]shop|locker|punt\b|point)', re.I)
+ADDRESS_HINT_RE = re.compile(r'(^(street|address|housenumber|house_number|postal[_ ]?code|zip|zipcode|city|province)$|address_line|_street$|_city$)', re.I)
 
 def walk_json(node, path="", out=None):
     if out is None:
@@ -301,7 +302,7 @@ def walk_json(node, path="", out=None):
             p = f"{path}.{k}" if path else k
             if isinstance(v, str) and DEADLINE_KEY_RE.search(k) and re.search(r'\d|t|T', v):
                 out.append((p, k, v))
-            elif isinstance(v, (str, int, float)) and PICKUP_HINT_RE.search(k):
+            elif isinstance(v, (str, int, float)) and (PICKUP_HINT_RE.search(k) or ADDRESS_HINT_RE.search(k)):
                 out.append((p, k, v))
             walk_json(v, p, out)
     elif isinstance(node, list):
@@ -683,6 +684,11 @@ def fetch_state(acct):
                 cookie_raw = cookie_header(cmap)
             if jcode == 200 and isinstance(jbody, dict) and not jbody.get("__error__"):
                 _journey_host_cache[name] = host if not host_cache else host_cache
+                try:
+                    open(os.path.join(DATA_DIR, f"txraw_journey_{name}_{oid}.json"), "w").write(
+                        json.dumps(jbody, indent=1, default=str))
+                except OSError:
+                    pass
                 merge_journey(t, jbody)
                 break
             if is_datadome_block(jcode, jbody):
@@ -733,10 +739,42 @@ def merge_journey(t, jbody):
         if isinstance(di, dict):
             _flatten_pickup_dicts(di, t)           # pickup point dicts if Vinted put them there
             for p, k, v in walk_json(di):
-                if DEADLINE_KEY_RE.search(k) and not t.get("deadline"):
+                if DEADLINE_KEY_RE.search(k) and not t.get("deadline") and str(v):
                     t["deadline"] = f"{k}: {v}"
-                elif PICKUP_HINT_RE.search(k) and isinstance(v, str) and len(v) < 120:
+                elif (PICKUP_HINT_RE.search(k) or ADDRESS_HINT_RE.search(k)) and isinstance(v, str) and len(v) < 120:
                     t["pickup"].setdefault(k, v)
+
+def _deadline_from_raw(t):
+    """Pre-shipment orders have no journey — mine the raw escrow object for
+    deadline-ish date keys (expected/ship-by/autocancel fields, shape-agnostic)."""
+    raw = t.get("raw")
+    if not isinstance(raw, dict):
+        return
+    val_re = re.compile(r'\d{4}-\d{2}-\d{2}', re.I)
+    leaves = []
+    def _gen(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield k, v
+                yield from _gen(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from _gen(v)
+    CREATE_RE = re.compile(r'^(date|created|.*_at|.*_ts|updated.*?)$', re.I)
+    SHIPBY_RE = re.compile(r'(deadline|until|expir|expected|ship.?by|ship_.*date|due)', re.I)
+    # priority 1: deadline-ish KEY names with a date value
+    for k, v in _gen(raw):
+        kl = str(k).lower()
+        if isinstance(v, str) and SHIPBY_RE.search(kl) and val_re.search(v) and not CREATE_RE.fullmatch(kl):
+            t.setdefault("deadline", f"{kl}: {v[:60]}")
+            return
+    # priority 2: any other non-creation date key
+    for k, v in _gen(raw):
+        kl = str(k).lower()
+        if isinstance(v, str) and ("date" in kl or "time" in kl) and val_re.search(v) \
+                and not CREATE_RE.fullmatch(kl):
+            t.setdefault("deadline", f"{kl}: {v[:60]}")
+            return
 
 def fetch_vinted(acct) -> list:
     if SAMPLE_MODE:
@@ -757,6 +795,8 @@ def fetch_vinted(acct) -> list:
         t["account"] = acct.get("name") or "main"
         t.setdefault("role", "in")
         t.setdefault("track", None)
+        if not t.get("deadline"):
+            _deadline_from_raw(t)
     return data["transactions"]
 
 # ------------------------- bol source (GraphQL persisted ops) -------------------------
