@@ -21,6 +21,7 @@
 #   python3 tracker.py            # normal operation (config.json)
 #   python3 tracker.py --sample   # serve built-in sample data, no network
 
+import uuid
 import base64, json, os, re, sqlite3, sys, threading, time
 import urllib.parse
 import urllib.request
@@ -736,20 +737,44 @@ BOL_OVERVIEW = {"operationName": "CsAccountOrdersOverviewClient",
                     "sha256Hash": "sha256:8b5eed70df09545fe331e288c5f12b58af210a5c0ec6a85f782ba0af645791b7",
                     "version": 1}}}
 
+def _bol_headers(ua, cookie_raw, op_name):
+    """Replicate the SPA's api/graphql request surface (verified 2026-10-29 capture).
+    x-xsrf-token MUST equal the XSRF-TOKEN cookie value (double-submit)."""
+    xsrf = ""
+    try:
+        for part in cookie_raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "XSRF-TOKEN":
+                xsrf = v
+                break
+    except Exception:
+        pass
+    page_id = str(uuid.uuid4())
+    return {"content-type": "application/json",
+            "accept": "application/graphql-response+json, application/graphql+json, application/json, text/event-stream, multipart/mixed",
+            "accept-language": "nl-NL",
+            "accept-encoding": "gzip",
+            "origin": "https://www.bol.com",
+            "referer": "https://www.bol.com/nl/nl/account/bestellingen/overzicht/",
+            "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+            "m2-page-id": page_id,
+            "x-xsrf-token": xsrf,
+            "bol-client-page-id": page_id,
+            "bol-app-country": "NL",
+            "bol-client-app-name": "cs-account-apps-remix-web-fe",
+            "bol-app-operation-name": op_name,
+            "user-agent": ua or "Mozilla/5.0",
+            "cookie": cookie_raw}
+
 def _bol_graph(payload, ua, cookie_raw, timeout=30):
-    import gzip, zlib
+    import gzip
     def _read(raw):
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)
         return raw.decode("utf-8", "replace")
-    req = urllib.request.Request(BOL_OPS, data=json.dumps(payload).encode(),
-                                 headers={"content-type": "application/json",
-                                          "accept": "application/json",
-                                          "accept-encoding": "gzip",
-                                          "origin": "https://www.bol.com",
-                                          "referer": "https://www.bol.com/nl/nl/account/bestellingen",
-                                          "user-agent": ua or "Mozilla/5.0",
-                                          "cookie": cookie_raw})
+    op = payload.get("operationName") or ""
+    headers = _bol_headers(ua, cookie_raw, op)
+    req = urllib.request.Request(BOL_OPS, data=json.dumps(payload).encode(), headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(_read(r.read()))
@@ -847,11 +872,13 @@ def fetch_bol(acct) -> list:
     if code == 200 and not payload.get("errors"):
         rows = parse_bol_orders(payload, name)
     elif code == 403:   # Akamai wall on the API POST — try the server-rendered page
-        req = urllib.request.Request("https://www.bol.com/nl/nl/account/bestellingen",
+        req = urllib.request.Request("https://www.bol.com/nl/nl/account/bestellingen/overzicht/",
                                      headers={"user-agent": acct.get("user_agent") or "Mozilla/5.0",
                                               "accept": "text/html,application/xhtml+xml",
                                               "accept-encoding": "gzip",
                                               "accept-language": "nl-NL,nl;q=0.9",
+                                              "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
+                                              "sec-fetch-site": "none",
                                               "cookie": cookie_raw})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
