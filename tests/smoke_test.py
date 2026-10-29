@@ -5,9 +5,14 @@ Starts the server as a real child process (Popen), probes the HTTP endpoints,
 then shuts it down. tracker.py --sample serves on :8080 in the foreground.
 Sample data covers both sources (vinted + postnl).
 """
-import json, subprocess, sys, time, urllib.request
+import json, os, shutil, subprocess, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:8080"
+
+# fresh data dir every run: seeded rows must never leak between runs (the sample
+# DB used to keep rows from earlier, bigger fixtures and flip the row counts)
+if os.path.isdir(".data"):
+    shutil.rmtree(".data")
 
 server = subprocess.Popen(
     [sys.executable, "tracker.py", "--sample"],

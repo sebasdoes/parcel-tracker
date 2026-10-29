@@ -706,6 +706,33 @@ _journey_host_cache: dict[str, str] = {}
 
 GMAPS = "https://www.google.com/maps/search/?api=1&query="
 
+# Retention knowledge (user-provided 2026-10-29):
+#   DHL: points/ServicePoints 7 days; lockers (Packstation/parcel locker) 5 days.
+#   PostNL: points (Pakjegemak/PUP) 5 days; lockers 72 hours.
+# ONLY known couriers get a bracket; unknown carriers show NOTHING.
+def retention_note(t):
+    if p_class(t.get("state")) != "wait":   # bracket only while the parcel sits at a point
+        return ""
+    carrier = ""
+    raw = t.get("raw") if isinstance(t.get("raw"), dict) else {}
+    for c in (t.get("carrier"), (t.get("pickup") or {}).get("carrier"), raw.get("carrier_code")):
+        if c:
+            carrier = str(c).lower()
+            break
+    hay = " ".join(str(x) for x in (carrier, (t.get("pickup") or {}).get("point", ""),
+                                    raw.get("pickup_point_type") or "")).lower()
+    if re.search(r"dhl", carrier or hay):
+        if re.search(r"locker|packstation|parcel_locker|pakkautomaat", hay):
+            return " (kept for 5 days)"
+        if re.search(r"point|servicepoint|service point|pup|parcelshop|parcel shop|shop|punt|pakjegemak", hay):
+            return " (kept for 7 days)"
+    if re.search(r"postnl", carrier or hay):
+        if re.search(r"locker", hay):
+            return " (kept for 72 hours)"
+        if re.search(r"point|pup|pakjegemak|servicepoint|shop|punt|pickup", hay):
+            return " (kept for 5 days)"
+    return ""   # courier or point-type unknown -> no bracket (honest)
+
 def fetch_shipment_point(host, ua, cookie_raw, referer, escrow_id, name):
     """GET /api/v2/escrow_orders/<id>/shipment (user-verified): carries the pick-up
     point even when journey_summary is all-null. Returns (name, address) or None."""
@@ -748,6 +775,8 @@ def merge_journey(t, jbody):
     if jst:
         t["state"] = jst                           # parcel-flow state beats the buyer-flow "waiting"
     cc = j.get("current_carrier") or {}
+    if cc.get("code"):
+        t["carrier"] = cc["code"]
     if cc.get("tracking_url"):
         t["track"] = cc["tracking_url"]
     details = j.get("details") or []
@@ -1296,12 +1325,13 @@ def until_display(value):
         return tail, tail[:10] + "…"
     return None, s
 
-def render_transactions(rows, heading, note=""):
+def render_transactions(rows, heading, note="", since_label=False):
     out = f"<h2>{heading}</h2>"
     if not rows:
         out += f'<p class="muted">{note or "none"}</p>'
         return out
-    out += "<div class='tablewrap'><table><tr><th>Item</th><th>Status</th><th>Where</th><th>Until</th></tr>"
+    fourth = "Since" if since_label else "Until"
+    out += f"<div class='tablewrap'><table><tr><th>Item</th><th>Status</th><th>Where</th><th>{fourth}</th></tr>"
     for t in rows:
         until_iso, until_plain = until_display(t.get("deadline"))
         until_attr = f' data-until="{until_iso}" data-show="{until_iso[:10]}"' if until_iso else ""
@@ -1325,7 +1355,7 @@ def render_transactions(rows, heading, note=""):
         out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{where or '—'}</td>"
-                f"<td{until_attr}>{until_plain or '—'}</td></tr>")
+                f"<td{until_attr}>{(until_plain or '—') + retention_note(t)}</td></tr>")
     return out + "</table></div>"
 
 def render_history(con):
@@ -1386,7 +1416,7 @@ def build_page():
         others_note = ""
     body = (f"<h1><span class='dot {dot}'></span> Parcels {btn_badges}</h1>"
             + modals_html
-            + render_transactions(waiting, "Awaiting pick-up", others_note or "nothing waiting")
+            + render_transactions(waiting, "Awaiting pick-up", others_note or "nothing waiting", since_label=True)
             + render_transactions(others, "Everything else", "nothing yet")
             + hist
             + ("<div class='refreshed'>last poll: "
