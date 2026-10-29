@@ -737,16 +737,24 @@ BOL_OVERVIEW = {"operationName": "CsAccountOrdersOverviewClient",
                     "version": 1}}}
 
 def _bol_graph(payload, ua, cookie_raw, timeout=30):
+    import gzip, zlib
+    def _read(raw):
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        return raw.decode("utf-8", "replace")
     req = urllib.request.Request(BOL_OPS, data=json.dumps(payload).encode(),
                                  headers={"content-type": "application/json",
                                           "accept": "application/json",
+                                          "accept-encoding": "gzip",
+                                          "origin": "https://www.bol.com",
+                                          "referer": "https://www.bol.com/nl/nl/account/bestellingen",
                                           "user-agent": ua or "Mozilla/5.0",
                                           "cookie": cookie_raw})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode())
+            return r.status, json.loads(_read(r.read()))
     except HTTPError as e:
-        return e.code, {"__error__": e.read().decode("utf-8", "replace")}
+        return e.code, {"__error__": _read(e.read())}
     except Exception as e:
         return 0, {"__error__": str(e)}
 
@@ -776,6 +784,45 @@ def parse_bol_orders(payload, name):
                          "raw": it})
     return rows
 
+def parse_bol_html(html, name):
+    """Server-rendered fallback: pull orders out of __NEXT_DATA__ (or any embedded JSON)."""
+    import re
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return []
+    # find objects shaped like ShopOrder without assuming the exact path
+    found = []
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("__typename") == "ShopOrder" or ("items" in node and "reference" in node and isinstance(node.get("items"), list)):
+                found.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(data)
+    rows = []
+    for o in found:
+        created = o.get("creationDateTime")
+        for it in o.get("items") or []:
+            off = it.get("offerInformation") or {}
+            rows.append({"source": "bol", "account": name,
+                         "order_id": str(it.get("id") or f"{o.get('reference')}-?"),
+                         "role": "in",
+                         "title": off.get("productTitle") or it.get("productTitle") or "",
+                         "state": (it.get("status") or {}).get("shortTranslatedStatus") or "",
+                         "updated_at": created,
+                         "pickup": {"retailer": (off.get("retailer") or {}).get("name") or "bol"},
+                         "deadline": None,
+                         "track": (BOL_META + it["url"]) if it.get("url") else None,
+                         "raw": it})
+    return rows
+
 def fetch_bol(acct) -> list:
     name = acct.get("name") or "main"
     if SAMPLE_MODE:
@@ -796,11 +843,34 @@ def fetch_bol(acct) -> list:
             json.dumps({"http": code, "payload": payload}, indent=1, default=str))
     except OSError:
         pass
-    if code != 200:
-        raise RuntimeError(f"bol graphql HTTP {code}: {str(payload)[:160]}")
-    if payload.get("errors"):
-        raise RuntimeError(f"bol graphql errors: {json.dumps(payload['errors'])[:200]}")
-    rows = parse_bol_orders(payload, name)
+    rows = None
+    if code == 200 and not payload.get("errors"):
+        rows = parse_bol_orders(payload, name)
+    elif code == 403:   # Akamai wall on the API POST — try the server-rendered page
+        req = urllib.request.Request("https://www.bol.com/nl/nl/account/bestellingen",
+                                     headers={"user-agent": acct.get("user_agent") or "Mozilla/5.0",
+                                              "accept": "text/html,application/xhtml+xml",
+                                              "accept-encoding": "gzip",
+                                              "accept-language": "nl-NL,nl;q=0.9",
+                                              "cookie": cookie_raw})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+            if raw[:2] == b"\x1f\x8b":
+                import gzip as _gz
+                raw = _gz.decompress(raw)
+            html = raw.decode("utf-8", "replace")
+            if "/nl/nl/inloggen" in html[:3000] or 'name="login' in html[:3000]:
+                raise RuntimeError("bol HTML fallback: session invalid (redirected to login) — re-copy the cookie header from a logged-in request")
+            open(os.path.join(DATA_DIR, f"txraw_bol_{name}_html.bin"), "w").write(html)
+            rows = parse_bol_html(html, name)
+            log(f"[{name}] bol graphql 403 (akamai) — HTML fallback returned {len(rows)} rows")
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"bol API 403 + HTML fallback HTTP {e.code}")
+    if rows is None:
+        if code != 200:
+            raise RuntimeError(f"bol graphql HTTP {code}: {str(payload)[:160]}")
+        raise RuntimeError(f"bol graphql errors: {json.dumps(payload.get('errors'))[:200]}")
     for t in rows:
         t.setdefault("track", None); t.setdefault("role", "in")
     return rows
