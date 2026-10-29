@@ -391,8 +391,25 @@ def fetch_state(acct):
     if is_datadome_block(code, body):
         return False, {"error": "datadome_challenge"}
     if code != 200 or not isinstance(body.get("user", body), dict):
-        return False, {"error": f"users/current HTTP {code}",
-                       "hint": "session cookie stale or wrong domain cookies"}
+        # self-document the failure: response body snip + the cookie names
+        # actually on the file (stale value or misnamed cookie show up instantly)
+        cookie_names = sorted({m.group(2) for m in re.finditer(r'(?:(^|;)\s*(?:)?)([A-Za-z0-9_.-]+)=', cookie_raw or "")})
+        try:
+            dump = {
+                "call": "users/current", "http": code,
+                "body": str(body)[:600],
+                "cookies_file": os.path.basename(cookie_path),
+                "cookie_names": cookie_names,
+                "user_agent_used": (ua or "")[:120],
+            }
+            open(os.path.join(DATA_DIR, f"txraw_{name}.json"), "w").write(json.dumps(dump, indent=1))
+        except Exception:
+            pass
+        log(f"[{name}] users/current HTTP {code}; cookies on file: {cookie_names}")
+        hint = "session cookie stale or wrong domain cookies"
+        if code == 401:
+            hint = "session value stale/renamed — re-copy the FULL Cookie header from a logged-in page"
+        return False, {"error": f"users/current HTTP {code}", "hint": hint}
     user = body.get("user") or body
     uid = user.get("id")
     if not uid:
