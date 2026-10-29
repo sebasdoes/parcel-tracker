@@ -520,8 +520,8 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
 
 def fetch_state(acct):
     """returns (ok, data) — data carries user id + parsed transactions."""
-    domain = acct.get("domain") or "www.vinted.nl"
-    base = f"https://{domain}"
+    requested_domain = acct.get("domain") or "www.vinted.nl"
+    domain = requested_domain
     ua = acct.get("user_agent") or os.environ.get("USER_AGENT", "")
     name = acct.get("name") or "main"
     cookie_raw = None
@@ -532,9 +532,23 @@ def fetch_state(acct):
             return False, {"error": f"cookies file missing/empty ({cookie_path})",
                            "hint": "copy cookies into data/ per config.json"}
         cmap = cookie_map(cookie_raw)
+        # The session cookie carries the account's home domain (_vinted_fr_session
+        # etc.). OAuth grants are per-domain clients — posting a .fr refresh token
+        # at .nl yields invalid_grant ("issued to another client"). Trust the
+        # cookie, log the correction.
+        mloc = re.search(r"_vinted_([a-z]{2})_session", " " + " ".join(cmap))
+        if mloc:
+            cookie_domain = f"www.vinted.{mloc.group(1)}"
+            if cookie_domain != requested_domain:
+                log(f"[{name}] domain corrected: cookies are for {cookie_domain} "
+                    f"(config said {requested_domain}) — using the cookie's domain")
+                VINTED_META[name] = {"domain": cookie_domain}
+            domain = cookie_domain
+        base = f"https://{domain}"
         refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
         if refreshed_raw:
             cookie_raw = refreshed_raw
+    base = f"https://{domain}"      # outer: also set for the sample-mode path
     code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
     if setc and cookie_raw:
         cmap = cookie_map(cookie_raw)
