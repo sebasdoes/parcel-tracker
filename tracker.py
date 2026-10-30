@@ -1372,6 +1372,25 @@ tr:last-child td { border-bottom:none; }
 .refreshed { color:#8b949e; font-size:.78em; margin-top:10px; }
 a { color:#58a6ff; }
 
+/* filter bar: chips + search */
+.filterbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px;
+             margin:14px 0 0; padding:8px 10px; background:#161b22;
+             border:1px solid #21262d; border-radius:8px; }
+.filterbar .fgroup { color:#8b949e; font-size:.66em; text-transform:uppercase;
+                     letter-spacing:.1em; margin-right:2px; }
+.chip { display:inline-flex; align-items:center; background:#0d1117; border:1px solid #30363d;
+        border-radius:16px; padding:2px 10px; font:inherit; font-size:.78em;
+        color:#e6edf3; cursor:pointer; }
+.chip:hover { border-color:#8b949e; }
+.chip.on { background:rgba(56,139,253,.18); border-color:#58a6ff; color:#58a6ff; }
+.fsearch { flex:1 1 170px; min-width:120px; max-width:300px; background:#0d1117; color:#e6edf3;
+           border:1px solid #30363d; border-radius:16px; padding:4px 12px; font:inherit;
+           font-size:.85em; }
+.fsearch:focus { outline:none; border-color:#58a6ff; }
+.fsearch::placeholder { color:#484f58; }
+tr[hidden], .fsec[hidden] { display:none !important; }
+#nohits { display:none; margin-top:8px; }
+
 """
 
 JS_COUNTDOWN = """
@@ -1399,6 +1418,68 @@ document.querySelectorAll('.modal').forEach(function (m) {
   var box = m.querySelector('.box');
   if (box) box.addEventListener('click', function (e) { e.stopPropagation(); });
 });"""
+
+JS_FILTERS = """
+// filter chips + search bar (client-side; survives the 60s meta-refresh via sessionStorage)
+function fApply() {
+  var bar = document.querySelector('.filterbar');
+  var q = bar ? ((bar.querySelector('#fsearch') || {}).value || '').trim().toLowerCase() : '';
+  var st = {};                                   // group -> {val: true}
+  document.querySelectorAll('.chip[data-group]').forEach(function (c) {
+    if (c.classList.contains('on')) (st[c.dataset.group] = st[c.dataset.group] || {})[c.dataset.val] = true;
+  });
+  var vis = 0, total = 0;
+  document.querySelectorAll('.frow').forEach(function (r) {
+    total++;
+    var show = true;
+    for (var g in st) {
+      var v = r.dataset[g] || '';
+      if (!v || !st[g][v]) { show = false; break; }
+    }
+    if (show && q && r.textContent.toLowerCase().indexOf(q) < 0) show = false;
+    r.hidden = !show;
+    if (show) vis++;
+  });
+  document.querySelectorAll('.fsec').forEach(function (sec) {
+    var frows = sec.querySelectorAll('.frow');
+    if (frows.length) sec.hidden = (sec.querySelectorAll('.frow:not([hidden])').length === 0);
+  });
+  var nh = document.getElementById('nohits');
+  if (nh) nh.style.display = (total && !vis) ? 'block' : 'none';
+  // '' would fall back to the stylesheet's #nohits{display:none} — set 'block' explicitly
+  try { sessionStorage.setItem('pfilters',
+        JSON.stringify({chips: st, q: (bar && bar.querySelector('#fsearch') || {}).value || ''})); } catch (e) {}
+}
+function fRestore(bar) {
+  var s = null;
+  try { s = JSON.parse(sessionStorage.getItem('pfilters') || 'null'); } catch (e) {}
+  if (!s) return;
+  var chips = s.chips || {};
+  bar.querySelectorAll('.chip[data-group]').forEach(function (c) {
+    if (chips[c.dataset.group] && chips[c.dataset.group][c.dataset.val]) c.classList.add('on');
+  });
+  var fq = bar.querySelector('#fsearch');
+  if (fq && s.q) { fq.value = s.q; }
+}
+var _fbar = document.querySelector('.filterbar');
+if (_fbar) {
+  _fbar.querySelectorAll('.chip[data-group]').forEach(function (c) {
+    c.addEventListener('click', function () { c.classList.toggle('on'); fApply(); });
+  });
+  var _fs = _fbar.querySelector('#fsearch');
+  if (_fs) {
+    _fs.addEventListener('input', fApply);
+    _fs.addEventListener('keydown', function (e) { if (e.key === 'Escape') { _fs.value = ''; fApply(); } });
+  }
+  var _fc = _fbar.querySelector('#fclear');
+  if (_fc) _fc.addEventListener('click', function () {
+    _fbar.querySelectorAll('.chip.on').forEach(function (c) { c.classList.remove('on'); });
+    if (_fs) _fs.value = '';
+    fApply();
+  });
+  fRestore(_fbar);
+  fApply();
+}"""
 
 def p_class(state):
     s = (state or "").lower()
@@ -1488,7 +1569,9 @@ def rel_time(iso):
     return (f"in {txt}" if future else f"{txt} ago").strip()
 
 def esc(s):
-    return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+    # ' -> &#39; too: account names and labels land in single-quoted HTML attributes
+    return (str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+            .replace('"','&quot;').replace("'",'&#39;'))
 
 def until_display(value):
     """Return (iso_or_None, plain_text) for a deadline field."""
@@ -1536,7 +1619,10 @@ def render_transactions(rows, heading, note="", since_label=False):
         parts += [str(v) for k, v in pk.items()
                   if v and k not in ("last", "ev", "point", "point_url")]
         where = "; ".join(parts)
-        out += (f"<tr><td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
+        row_src = t.get("source") or "vinted"
+        row_acct = (t.get("account") or "").strip()
+        out += (f"<tr class='frow' data-source='{esc(row_src)}' data-account='{esc(row_acct)}'>"
+                f"<td>{title}<div class='muted'><span class='src'>{src}</span> · {t.get('order_id','')}</div></td>"
                 f"<td><span class='pill {p_class(t.get('state'))}'>{t.get('state') or '?'}</span></td>"
                 f"<td class='muted'>{where or '—'}</td>"
                 f"<td{until_attr}>{((rel_time(until_iso) or until_plain) if until_iso else until_plain or '—') + retention_note(t)}</td></tr>")
@@ -1554,7 +1640,9 @@ def render_history(con):
     for r in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"]))
         name = r["source"] if r["account"] in ("main", "") else f"{r['source']}/{r['account']}"
-        out += f"<tr><td class='muted'>{when}</td><td class='muted'>[{name}] {r['order_id']}</td><td>{r['detail'] or r['kind']}</td></tr>"
+        out += (f"<tr class='frow' data-source='{esc(r['source'])}' data-account='{esc(r['account'])}'>"
+                f"<td class='muted'>{when}</td><td class='muted'>[{name}] {r['order_id']}</td>"
+                f"<td>{r['detail'] or r['kind']}</td></tr>")
     return out + "</table>"
 
 def _mask_cookie(v):
@@ -1770,11 +1858,45 @@ def build_page():
         others_note = "nothing yet"
     else:
         others_note = ""
+    # filter bar: source chips grouped shop/courier + account chips + search box.
+    # Sources/accounts come from the transaction set (chips stay stable across the
+    # 60s refresh even when a source currently has no fresh rows on screen).
+    def _chip(group, val, label):
+        return (f"<button type='button' class='chip' data-group='{esc(group)}' "
+                f"data-val='{esc(val)}'>{esc(label)}</button>")
+    chip_srcs = sorted({(t.get("source") or "vinted") for t in rows})
+    shop_srcs = [s for s in chip_srcs if source_category(s) == "shop"]
+    courier_srcs = [s for s in chip_srcs if source_category(s) != "shop"]
+    chip_accts = sorted({(t.get("account") or "").strip() for t in rows} - {"", "main"})
+    # "main" is the placeholder account for legacy rows: the source chips already
+    # cover it, and a bare "main" chip in the Account group reads as noise.
+    chip_html = ""
+    if shop_srcs:
+        chip_html += ("<span class='fgroup'>Shop</span>" + "".join(
+            _chip("source", s, (SOURCE_REGISTRY.get(s) or {}).get("label", s)) for s in shop_srcs))
+    if courier_srcs:
+        chip_html += ("<span class='fgroup'>Courier</span>" + "".join(
+            _chip("source", s, (SOURCE_REGISTRY.get(s) or {}).get("label", s)) for s in courier_srcs))
+    if chip_accts:
+        chip_html += ("<span class='fgroup'>Account</span>" + "".join(
+            _chip("account", a, a) for a in chip_accts))
+    fbar_html = ""
+    if chip_html:
+        fbar_html = ("<div class='filterbar' id='fbar'>" + chip_html
+                     + "<input id='fsearch' class='fsearch' type='search' autocomplete='off' "
+                       "placeholder='search title / order / track…'>"
+                     + "<button type='button' class='chip' id='fclear'>clear</button></div>"
+                     + "<p id='nohits' class='muted'>nothing matches the current filter</p>")
     body = (f"<h1><span class='dot {dot}'></span> Parcels {btn_badges}</h1>"
             + modals_html
+            + fbar_html
+            + "<section class='fsec'>"
             + render_transactions(waiting, "Awaiting pick-up", others_note or "nothing waiting", since_label=True)
+            + "</section>"
+            + "<section class='fsec'>"
             + render_transactions(others, "Everything else", "nothing yet")
-            + hist
+            + "</section>"
+            + "<section class='fsec'>" + hist + "</section>"
             + ("<div class='refreshed'>last poll: "
                + (time.strftime("%H:%M", time.localtime(last_seen)) if last_seen else "never")
                + "</div>"))
@@ -1782,7 +1904,7 @@ def build_page():
             '<meta name=viewport content="width=device-width,initial-scale=1">'
             '<meta http-equiv="refresh" content="60">'
             f"<title>Parcels</title><style>{STYLE}</style>"
-            f"</head><body>{body}<script>{JS_COUNTDOWN}</script></body></html>")
+            f"</head><body>{body}<script>{JS_COUNTDOWN}{JS_FILTERS}</script></body></html>")
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, ctype, body, cache=False):
