@@ -72,6 +72,17 @@ shape. `user_agent` **must** be the *exact* User-Agent of that browser
 (DevTools → Console → `navigator.userAgent`). DataDome scores cookie
 consistency against IP and UA; a mismatched UA raises challenge risk.
 
+## Configuration: web interface
+
+Point your browser at `http://<host>:8085/config` — accounts are added, edited and deleted there and stored in the local sqlite (`tracker.db`, `accounts` table). Categories:
+
+- **Shops:** Vinted, bol.com (Amazon planned)
+- **Couriers:** PostNL (DHL/others planned)
+
+Each shop account takes a pasted FULL Cookie header (+ User-Agent); PostNL takes email/password. "Save & test" runs one live poll and reports the row count or the error. Accounts apply on the next poll — no restarts. Secrets are masked in the UI.
+
+Migration: on first start after upgrading, accounts from your old `config.json` are imported into sqlite automatically — including the contents of the `cookies-*.json` files. The old files stay as a fallback; delete them whenever you're happy with the web config.
+
 ### 3. Install (two variants)
 
 **Quadlet (CoreOS / podman systemd) — see `deploy/parcel-tracker.container`:**

@@ -85,20 +85,173 @@ def poll_seconds() -> int:
 def webhook_url() -> str:
     return str(load_config().get("webhook_url") or "").strip()
 
-def acct_list(source: str) -> list:
-    """Enabled accounts for one source, from config.json (legacy env fallback)."""
-    if SAMPLE_MODE:
-        return [{"name": "main"}]
+# ------------------------- source registry + account store (sqlite) -------------------------
+
+SOURCE_REGISTRY = {
+    "vinted":    {"category": "shop",    "label": "Vinted",
+                  "fields": [("name", "Account name"),
+                             ("cookie", "Full Cookie header (paste from a logged-in request)"),
+                             ("user_agent", "User-Agent (optional — same browser as the cookie)"),
+                             ("domain", "Domain (optional, e.g. www.vinted.nl)")]},
+    "bol":       {"category": "shop",    "label": "bol.com",
+                  "fields": [("name", "Account name"),
+                             ("cookie", "Full Cookie header"),
+                             ("user_agent", "User-Agent (optional)")]},
+    "amazon":    {"category": "shop",    "label": "Amazon", "planned": True,
+                  "fields": [("name", "Account name"), ("cookie", "Full Cookie header"),
+                             ("user_agent", "User-Agent (optional)")]},
+    "postnl":    {"category": "carrier", "label": "PostNL",
+                  "fields": [("name", "Account name"), ("email", "Email"),
+                             ("password", "Password")]},
+}
+
+def source_category(source):
+    return (SOURCE_REGISTRY.get(source) or {}).get("category", "shop")
+
+def db_accounts(source=None) -> list:
+    """Account rows [{name, <config fields>}], newest first."""
+    out = []
+    try:
+        with db() as con:
+            if source:
+                rows = con.execute("SELECT name, config FROM accounts WHERE source=? ORDER BY name",
+                                   (source,)).fetchall()
+            else:
+                rows = con.execute("SELECT source, name, config FROM accounts ORDER BY source, name").fetchall()
+        for r in rows:
+            try:
+                cfg = json.loads(r["config"] or "{}")
+            except json.JSONDecodeError:
+                cfg = {}
+            a = dict(cfg)
+            a["name"] = r["name"]
+            if source:
+                a["source"] = source
+            else:
+                a["source"] = r["source"]
+            out.append(a)
+    except sqlite3.OperationalError:
+        pass
+    return out
+
+def save_account(source, name, fields: dict):
+    import time as _t
+    with db() as con:
+        con.execute("""INSERT INTO accounts(source, name, config, updated) VALUES(?,?,?,?)
+                       ON CONFLICT(source, name) DO UPDATE SET config=excluded.config, updated=excluded.updated""",
+                    (source, name, json.dumps(fields or {}), _t.time()))
+
+def delete_account(source, name):
+    with db() as con:
+        con.execute("DELETE FROM accounts WHERE source=? AND name=?", (source, name))
+
+def save_account_cookie(source, name, raw):
+    """Write a rotated cookie map back to the account's DB row (web-configured accounts)."""
+    with db() as con:
+        row = con.execute("SELECT config FROM accounts WHERE source=? AND name=?", (source, name)).fetchone()
+        if not row:
+            return
+        try:
+            cfg = json.loads(row["config"] or "{}")
+        except json.JSONDecodeError:
+            cfg = {}
+        cfg["cookie"] = raw
+        con.execute("UPDATE accounts SET config=?, updated=? WHERE source=? AND name=?",
+                    (json.dumps(cfg), time.time(), source, name))
+    log(f"cookie rotated in db ({source}/{name})")
+
+def acct_cookie(acct) -> str | None:
+    """Cookie raw text for an account: db-stored cookie first, else the legacy file."""
+    c = acct.get("cookie")
+    if isinstance(c, str) and c.strip():
+        txt = c.strip()
+        if txt.lower().startswith("cookie:"):
+            txt = txt[7:].strip()
+        return txt
+    if acct.get("cookies_file"):
+        return load_cookies(os.path.join(DATA_DIR, acct["cookies_file"]))
+    return None
+
+def _persist_cookie_map(acct, raw_map):
+    """Persist a rotated cookie map into the account's store (db or file)."""
+    c = acct.get("cookie")
+    if isinstance(c, str) and c.strip():
+        save_account_cookie(acct.get("source") or "", acct.get("name") or "main", cookie_header(raw_map))
+        return
+    if acct.get("cookies_file"):
+        path = os.path.join(DATA_DIR, acct["cookies_file"])
+        try:
+            open(path, "w").write(cookie_header(raw_map))
+            with COOKIE_LOCK:
+                _cookie_cache[path] = {"mtime": os.stat(path).st_mtime, "raw": cookie_header(raw_map)}
+        except OSError:
+            pass
+
+def rotate_store(acct, raw_map, setc):
+    """Fold Set-Cookie lines into raw_map; persist to the account's store."""
+    changed = False
+    for line in setc or []:
+        pair = line.split(";", 1)[0]
+        i = pair.find("=")
+        if i <= 0:
+            continue
+        nm, val = pair[:i].strip(), pair[i + 1:].strip()
+        if nm and val:
+            raw_map[nm] = val
+            changed = True
+    if not changed:
+        return
+    now = time.time()
+    key = f"{acct.get('source')}/{acct.get('name')}" if isinstance(acct, dict) else str(acct)
+    if now - _rotation_log_at.get(key, 0) > 600:
+        _rotation_log_at[key] = now
+        log(f"cookies rotated on {key}: refreshed names")
+    _persist_cookie_map(acct, raw_map)
+
+def import_file_accounts(source=None):
+    """One-time import of config.json accounts (incl. their cookie FILE contents)."""
     cfg = load_config()
     srcs = cfg.get("sources") if isinstance(cfg.get("sources"), dict) else {}
-    accounts = srcs.get(source)
-    if not (isinstance(accounts, list) and accounts) and source in ("vinted", "postnl"):
+    total = 0
+    for src_, accts in srcs.items():
+        if source and src_ != source:
+            continue
+        for a in (accts or []):
+            if not isinstance(a.get("dict", a), dict):
+                continue
+            fields = {k: v for k, v in a.items() if k not in ("name", "cookies_file")}
+            if a.get("cookies_file"):
+                try:
+                    txt = open(os.path.join(DATA_DIR, a["cookies_file"])).read().strip()
+                    if txt.lower().startswith("cookie:"):
+                        txt = txt[7:].strip()
+                    fields["cookie"] = txt
+                except OSError:
+                    pass
+            save_account(src_, str(a.get("name") or "main"), fields)
+            total += 1
+    if total:
+        log(f"[config] imported {total} account(s) from config.json into sqlite")
+    return total
+
+def acct_list(source: str) -> list:
+    """Enabled accounts for one source: sqlite `accounts` table first (web-configured),
+    falling back to a one-time import from config.json (incl. cookie file contents),
+    then the legacy env vars, then nothing."""
+    if SAMPLE_MODE:
+        return [{"name": "main"}]
+    rows = db_accounts(source)
+    if rows:
+        accounts = rows
+    else:
+        n = import_file_accounts(source)
+        accounts = db_accounts(source) if n else None
+    if not accounts and source in ("vinted", "postnl"):
         leg = legacy_env_account(source)
         if leg:
             accounts = [leg]
             if not log_warned["legacy"]:
-                log(f"config.json has no [{source}] accounts — using legacy env "
-                    f"(POSTNL_EMAIL/USER_AGENT). Migrate to config.json when easy.")
+                log(f"no accounts in sqlite/config for [{source}] — using legacy env vars")
                 log_warned["legacy"] = True
     seen, out = set(), []
     for a in accounts or []:
@@ -109,13 +262,14 @@ def acct_list(source: str) -> list:
             log(f"[{source}] skipping account with bad name: {name!r}")
             continue
         if name in seen:
-            log(f"[{source}] duplicate account name {name!r} — keeping the first")
+            log(f"[{source}] dup account {name!r} skipped")
             continue
         seen.add(name)
+        a = dict(a)
+        a.setdefault("name", name)
         out.append(a)
     return out
 
-log_warned = {"legacy": False}
 
 def legacy_env_account(source):
     """Pre-config installs: single account from the old env names."""
@@ -146,6 +300,14 @@ CREATE TABLE IF NOT EXISTS transactions (
     state    TEXT,
     data     TEXT NOT NULL,
     PRIMARY KEY (source, account, order_id)
+);
+CREATE TABLE IF NOT EXISTS accounts (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    config TEXT NOT NULL DEFAULT '{}',
+    updated REAL,
+    UNIQUE(source, name)
 );
 CREATE TABLE IF NOT EXISTS events (
     ts       REAL NOT NULL,
@@ -531,7 +693,7 @@ def _fold_refresh_tokens(raw_map, body):
             changed = True
     return changed
 
-def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
+def vinted_maybe_refresh(base, ua, acct, raw_map, name, csrf=""):
     """Proactive: refresh access_token_web when its JWT expires within REFRESH_MARGIN."""
     at = raw_map.get("access_token_web", "")
     exp = jwt_exp(at)
@@ -545,21 +707,16 @@ def vinted_maybe_refresh(base, ua, cookie_path, raw_map, name, csrf=""):
         return None
     csrf, home_setc = vinted_csrf(base, ua, cookie_header(raw_map), name)
     if home_setc:
-        rotate_cookies(cookie_path, raw_map, home_setc)
+        rotate_store(acct, raw_map, home_setc)
     access, setc, body = vinted_refresh(base, ua, cookie_header(raw_map), csrf, name=name)
     if not access:
         log(f"[{name}] proactive token refresh failed — keeping existing cookie set")
         return None
     raw_map["access_token_web"] = access
     rotated = _fold_refresh_tokens(raw_map, body)
-    rotate_cookies(cookie_path, raw_map, setc)
+    rotate_store(acct, raw_map, setc)
     if rotated:
-        # persist the rotated RT at once (the map is rebuilt from the file each poll)
-        open(cookie_path, "w").write(cookie_header(raw_map))
-        with COOKIE_LOCK:
-            if cookie_path in _cookie_cache:
-                _cookie_cache[cookie_path]["raw"] = cookie_header(raw_map)
-        log(f"[{name}] refresh_token rotated on file (single-use grant kept alive)")
+        log(f"[{name}] refresh_token rotated on store (single-use grant kept alive)")
     log(f"[{name}] access_token_web proactively refreshed (was expiring in {mins} min)")
     return cookie_header(raw_map)
 
@@ -574,24 +731,23 @@ def fetch_state(acct):
     name = acct.get("name") or "main"
     cookie_raw = None
     if not SAMPLE_MODE:
-        cookie_path = os.path.join(DATA_DIR, acct.get("cookies_file") or "cookies.json")
-        cookie_raw = load_cookies(cookie_path)
+        cookie_raw = acct_cookie(acct)
         if not cookie_raw:
-            return False, {"error": f"cookies file missing/empty ({cookie_path})",
-                           "hint": "copy cookies into data/ per config.json"}
+            return False, {"error": f"account has no cookies ({acct.get('name')})",
+                           "hint": "paste the Cookie header via the /config page (or a cookies_file)"}
         cmap = cookie_map(cookie_raw)
         # NOTE: _vinted_fr_session is Vinted's CONSTANT internal cookie name on ALL
         # country domains (fr = company legacy) — it does NOT indicate the domain.
         log(f"[{name}] poll domain: {domain} (config: {requested_domain or 'not set'}, "
             f"{len(cmap)} cookies)")
-        refreshed_raw = vinted_maybe_refresh(base, ua, cookie_path, cmap, name)
+        refreshed_raw = vinted_maybe_refresh(base, ua, acct, cmap, name)
         if refreshed_raw:
             cookie_raw = refreshed_raw
     base = f"https://{domain}"      # outer: also set for the sample-mode path
     code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
     if setc and cookie_raw:
         cmap = cookie_map(cookie_raw)
-        rotate_cookies(cookie_path, cmap, setc)
+        rotate_store(acct, cmap, setc)
         cookie_raw = cookie_header(cmap)
     if is_datadome_block(code, body):
         return False, {"error": "datadome_challenge"}
@@ -600,20 +756,16 @@ def fetch_state(acct):
         if cmap.get("refresh_token_web"):
             csrf, home_setc = vinted_csrf(base, ua, cookie_raw, name)
             if home_setc:
-                rotate_cookies(cookie_path, cmap, home_setc)
+                rotate_store(acct, cmap, home_setc)
                 cookie_raw = cookie_header(cmap)
                 setc_retry = None
             access, setc, body = vinted_refresh(base, ua, cookie_raw, csrf, name=name)
             if access:
                 cmap["access_token_web"] = access
                 rotated = _fold_refresh_tokens(cmap, body)
-                rotate_cookies(cookie_path, cmap, setc)
+                rotate_store(acct, cmap, setc)
                 if rotated:
-                    open(cookie_path, "w").write(cookie_header(cmap))
-                    with COOKIE_LOCK:
-                        if cookie_path in _cookie_cache:
-                            _cookie_cache[cookie_path]["raw"] = cookie_header(cmap)
-                    log(f"[{name}] refresh_token rotated on file (single-use grant kept alive)")
+                    log(f"[{name}] refresh_token rotated on store (single-use grant kept alive)")
                 cookie_raw = cookie_header(cmap)
                 code, body, setc = api_get("/api/v2/users/current", base, ua, cookie_raw)
                 log(f"[{name}] recovered from 401 via refresh_token_web")
@@ -625,7 +777,7 @@ def fetch_state(acct):
             dump = {
                 "call": "users/current", "http": code,
                 "body": str(body)[:600],
-                "cookies_file": os.path.basename(cookie_path),
+                "store": acct.get("cookies_file") or "db",
                 "cookie_names": cookie_names,
                 "user_agent_used": (ua or "")[:120],
             }
@@ -652,7 +804,7 @@ def fetch_state(acct):
                               escrow_base, ua, cookie_raw, referer=f"{base}/my_orders?order_type=purchased")
     if setc and cookie_raw:
         cmap = cookie_map(cookie_raw)
-        rotate_cookies(cookie_path, cmap, setc)
+        rotate_store(acct, cmap, setc)
         cookie_raw = cookie_header(cmap)
     if is_datadome_block(code, txp):
         return False, {"error": "datadome_challenge"}
@@ -680,7 +832,7 @@ def fetch_state(acct):
                                           referer=f"{base}/my_orders?order_type=purchased")
             if jsetc and cookie_raw:
                 cmap = cookie_map(cookie_raw)
-                rotate_cookies(cookie_path, cmap, jsetc)
+                rotate_store(acct, cmap, jsetc)
                 cookie_raw = cookie_header(cmap)
             if jcode == 200 and isinstance(jbody, dict) and not jbody.get("__error__"):
                 _journey_host_cache[name] = host if not host_cache else host_cache
@@ -989,12 +1141,9 @@ def fetch_bol(acct) -> list:
         for t in rows:
             t["source"] = "bol"; t["account"] = name
         return rows
-    if not acct.get("cookies_file"):
-        raise RuntimeError("bol account misconfigured: cookies_file needed")
-    cookie_path = os.path.join(DATA_DIR, acct["cookies_file"])
-    cookie_raw = load_cookies(cookie_path)
+    cookie_raw = acct_cookie(acct)
     if not cookie_raw:
-        raise RuntimeError(f"cookies file missing/empty ({cookie_path})")
+        raise RuntimeError(f"account has no cookies ({acct.get('name')}) — paste the header via /config")
     code, payload = _bol_graph(BOL_OVERVIEW, acct.get("user_agent"), cookie_raw)
     try:
         open(os.path.join(DATA_DIR, f"txraw_bol_{name}.json"), "w").write(
@@ -1408,6 +1557,178 @@ def render_history(con):
         out += f"<tr><td class='muted'>{when}</td><td class='muted'>[{name}] {r['order_id']}</td><td>{r['detail'] or r['kind']}</td></tr>"
     return out + "</table>"
 
+def _mask_cookie(v):
+    if not v:
+        return "—"
+    v = v.strip()
+    return f"{v[:12]}… ({len(v)} chars)" if len(v) > 14 else "…"
+
+def accounts_masked() -> dict:
+    """All accounts grouped by category; secrets masked."""
+    out = {"shop": {}, "carrier": {}}
+    for a in db_accounts():
+        cat = source_category(a["source"])
+        reg = SOURCE_REGISTRY.get(a["source"]) or {}
+        cfg = {k: a.get(k) for k, _ in reg.get("fields", []) if k != "name"}
+        shown = {}
+        for k, v in cfg.items():
+            if k == "cookie":
+                shown["cookie"] = _mask_cookie(v)
+            elif k == "password":
+                shown["password"] = "•••" if v else "—"
+            elif k == "email" and v:
+                shown["email"] = str(v)[:3] + "…" if len(str(v)) > 6 else "…"
+            else:
+                shown[k] = _html_short(v) if isinstance(v, str) else v
+        out.setdefault(cat, {}).setdefault(a["source"], []).append(
+            {"name": a["name"], "fields": shown})
+    return out
+
+def _html_short(s):
+    import html as _h
+    return (str(s) or "")
+from html import escape as _esc_attr
+
+CONFIG_STYLE = """
+  .cfgbox { background:#0d1117; border:1px solid #21262d; border-radius:10px; padding:14px 18px; margin:12px 0; }
+  .cfgbox h3 { margin:0 0 8px; font-size:1em; }
+  .cfgbox label { display:block; font-size:.8em; color:#8b949e; margin-top:8px; }
+  .cfgbox input, .cfgbox textarea, .cfgbox select { width:100%; background:#161b22; color:#e6edf3;
+      border:1px solid #30363d; border-radius:6px; padding:6px 8px; font:inherit; }
+  .cfgbox textarea { height:70px; font-family:ui-monospace,monospace; font-size:.8em; }
+  .cfgrow { display:flex; gap:8px; margin-top:10px; }
+  .btn { background:#238636; color:#fff; border:none; border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit; }
+  .btn.gray { background:#30363d; }
+  .btn.red { background:#8b1f1f; }
+  .acctlist td { padding:4px 8px; font-size:.85em; }
+  .acctlist .mono { font-family:ui-monospace,monospace; }
+  .okmsg { color:#3fb950; font-size:.85em; } .errmsg { color:#f85149; font-size:.85em; }
+  .planned { color:#8b949e; font-size:.78em; }
+"""
+
+CONFIG_JS = """
+const REG = __REG_JSON__;
+function fieldsFor(src) {
+  const f = document.getElementById('fields');
+  f.innerHTML = '';
+  (REG[src]?.fields || []).forEach(([k, label]) => {
+    const l = document.createElement('label');
+    l.textContent = label;
+    if (k === 'cookie') { const t = document.createElement('textarea'); t.id = 'f_' + k; l.appendChild(t); }
+    else { const i = document.createElement('input'); i.id = 'f_' + k; l.appendChild(i); }
+    f.appendChild(l);
+  });
+}
+function fill(src, name, flds) {
+  document.getElementById('srcsel').value = src; fieldsFor(src);
+  document.getElementById('f_name').value = name || '';
+  (REG[src]?.fields || []).forEach(([k]) => {
+    const el = document.getElementById('f_' + k);
+    if (!el) return;
+    el.value = (name && k === 'name') ? name : '';
+  });
+}
+async function api(path, body) {
+  const r = await fetch(path, {method: 'POST', headers: {'content-type': 'application/json'},
+                               body: JSON.stringify(body || {})});
+  return r.json();
+}
+async function saveAccount(test) {
+  const src = document.getElementById('srcsel').value;
+  const flds = {};
+  (REG[src]?.fields || []).forEach(([k]) => {
+    const el = document.getElementById('f_' + k);
+    if (el && el.value !== '') flds[k] = el.value;
+  });
+  const msg = document.getElementById('msg');
+  if (test) {
+    // save first, then run a live poll of this one account
+    const s = await api('/api/accounts', {op: 'save', source: src, fields: flds});
+    if (!s.ok) { msg.className = 'errmsg'; msg.textContent = s.error || 'save failed'; return; }
+    msg.textContent = 'saved — testing...'; msg.className = 'okmsg';
+    const t = await api('/api/accounts/test', {source: src, name: (flds.name || 'main')});
+    msg.className = t.ok ? 'okmsg' : 'errmsg';
+    msg.textContent = t.ok ? ('test OK — ' + (t.count ?? 0) + ' rows') : ('test failed — ' + (t.error || '?'));
+  } else {
+    const s = await api('/api/accounts', {op: 'save', source: src, fields: flds});
+    msg.className = s.ok ? 'okmsg' : 'errmsg';
+    msg.textContent = s.ok ? 'saved' : (s.error || 'save failed');
+  }
+  document.getElementById('msg').className = msg.className;   // keep class
+  if (s_ok(msg)) loadAccounts();
+}
+function s_ok(m) { return m.className && m.className.indexOf('ok') >= 0; }
+async function loadAccounts() {
+  const r = await fetch('/api/accounts.json'); const d = await r.json();
+  for (const cat of ['shop', 'carrier']) {
+    const el = document.getElementById(cat + '-accts');
+    el.innerHTML = '';
+    const srcs = d[cat] || {};
+    const any = Object.keys(srcs).length > 0;
+    (Object.keys(srcs) || []).forEach(src => {
+      (srcs[src] || []).forEach(a => {
+        const tr = document.createElement('tr');
+        const fld = Object.entries(a.fields).map(([k, v]) => {
+          if (v === null || v === undefined || v === '—' || v === '') return '';
+          return `${k}: <span class='mono'>${String(v).replace(/[<>&]/g, '')}</span>`;
+        }).filter(Boolean).join(' · ');
+        tr.innerHTML = `<td>${src}</td><td><b>${a.name}</b></td><td>${fld}</td>` +
+            `<td><button class='btn gray' onclick='editAcct("${src}","${a.name}")'>edit</button>` +
+            ` <button class='btn red' onclick='delAcct("${src}","${a.name}")'>delete</button></td>`;
+        el.appendChild(tr);
+      });
+    });
+    if (!any) el.innerHTML = "<tr><td class='planned' colspan='4'>no accounts yet — add one on the left</td></tr>";
+  }
+}
+async function delAcct(src, name) {
+  if (!confirm('Delete account ' + name + '?')) return;
+  const s = await api('/api/accounts', {op: 'delete', source: src, name: name});
+  loadAccounts();
+}
+function editAcct(src, name) {
+  fetch('/api/accounts.json').then(r => r.json()).then(d => {
+    const a = (d[source_category(src)]?.[src] || []).find(x => x.name === name) || {fields: {}};
+    fill(src, name, a.fields);
+  });
+}
+function source_category(src) { return REG[src]?.category || 'shop'; }
+window.onload = () => { fieldsFor(document.getElementById('srcsel').value); loadAccounts(); };
+"""
+
+def config_page():
+    reg_json = json.dumps({s: {"label": r.get("label", s), "category": r.get("category", "shop"),
+                               "fields": r.get("fields", []), "planned": r.get("planned", False)}
+                           for s, r in SOURCE_REGISTRY.items()})
+    js = CONFIG_JS.replace("__REG_JSON__", reg_json)
+    shops = sorted(s for s, r in SOURCE_REGISTRY.items() if r["category"] == "shop")
+    carriers = sorted(s for s, r in SOURCE_REGISTRY.items() if r["category"] == "carrier")
+    opts_shop = "".join(f"<option value='{s}'>{SOURCE_REGISTRY[s]['label']}{' (planned)' if SOURCE_REGISTRY[s].get('planned') else ''}</option>" for s in shops)
+    opts_car = "".join(f"<option value='{s}'>{SOURCE_REGISTRY[s]['label']}{' (planned)' if SOURCE_REGISTRY[s].get('planned') else ''}</option>" for s in carriers)
+    body = f"""
+    <h1><a href='/'>‹ parcels</a> <a href='/config' style='font-size:.6em;vertical-align:middle'>⚙ config</a></h1>
+    <div class='cfgbox'><h3>Add / edit an account</h3>
+      <label>Source</label>
+      <select id='srcsel' onchange='fieldsFor(this.value)'>
+        <optgroup label='Shops'>{opts_shop}</optgroup>
+        <optgroup label='Couriers'>{opts_car}</optgroup>
+      </select>
+      <div id='fields'></div>
+      <div class='cfgrow'>
+        <button class='btn' onclick='saveAccount(false)'>Save</button>
+        <button class='btn gray' onclick='saveAccount(true)'>Save &amp; test</button>
+        <span id='msg'></span>
+      </div>
+    </div>
+    <div class='cfgbox'><h3>Shops</h3><table class='acctlist'><tbody id='shop-accts'></tbody></table></div>
+    <div class='cfgbox'><h3>Couriers</h3><table class='acctlist'><tbody id='carrier-accts'></tbody></table></div>
+    <p class='muted' style='font-size:.78em'>Accounts apply on the next poll (≤15 min). Cookie headers are stored in the local sqlite; they're masked in this page after save.</p>
+    """
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            '<meta name=viewport content="width=device-width,initial-scale=1">'
+            f"<title>Parcel config</title><style>{STYLE}{CONFIG_STYLE}</style></head>"
+            f"<body>{body}<script>{js}</script></body></html>")
+
 def build_page():
     with db() as con:
         rows = db_rows(con)
@@ -1491,8 +1812,74 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     ev = [dict(r) for r in c.execute("SELECT ts, source, 'main' AS account, order_id, kind, detail FROM events ORDER BY ts DESC LIMIT 200")]
             self._send(200, "application/json", json.dumps(ev))
+        elif path == "/config":
+            self._send(200, "text/html; charset=utf-8", config_page())
+        elif path == "/api/accounts.json":
+            self._send(200, "application/json", json.dumps(accounts_masked()))
         else:
             self._send(404, "text/html", "<h1>404</h1>")
+
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path not in ("/api/accounts", "/api/accounts/test"):
+            self._send(404, "application/json", json.dumps({"ok": False, "error": "unknown"}))
+            return
+        try:
+            n = int(self.headers.get("content-length") or 0)
+            body = json.loads(self.rfile.read(n).decode() or "{}") if n else {}
+        except Exception:
+            self._send(400, "application/json", json.dumps({"ok": False, "error": "bad json"}))
+            return
+        src_name = str(body.get("source") or "")
+        if src_name not in SOURCE_REGISTRY:
+            self._send(400, "application/json", json.dumps({"ok": False, "error": "unknown source"}))
+            return
+        reg = SOURCE_REGISTRY[src_name]
+        allowed = {k for k, _ in reg.get("fields", [])}
+        name = str(body.get("name") or "")
+        if path == "/api/accounts/test":
+            rows = [a for a in db_accounts(src_name) if a["name"] == name]
+            if not rows:
+                self._send(200, "application/json", json.dumps({"ok": False, "error": "account not saved"}))
+                return
+            acct = dict(rows[0])
+            try:
+                if src_name == "vinted":
+                    data = fetch_vinted(acct)
+                elif src_name == "bol":
+                    data = fetch_bol(acct)
+                elif src_name == "postnl":
+                    data = fetch_postnl(acct)
+                else:
+                    raise RuntimeError(f"no live adapter for {src_name}")
+                self._send(200, "application/json", json.dumps({"ok": True, "count": len(data)}))
+            except Exception as e:
+                self._send(200, "application/json", json.dumps({"ok": False, "error": str(e)[:260]}))
+            return
+        op = body.get("op")
+        if op == "delete":
+            if not name:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": "name needed"}))
+                return
+            delete_account(src_name, name)
+            self._send(200, "application/json", json.dumps({"ok": True}))
+            return
+        if op != "save":
+            self._send(400, "application/json", json.dumps({"ok": False, "error": "bad op"}))
+            return
+        if reg.get("planned"):
+            self._send(400, "application/json", json.dumps({"ok": False, "error": f"{src_name} is not implemented yet"}))
+            return
+        fields = {k: str(v) for k, v in (body.get("fields") or {}).items() if k in allowed}
+        nm = str(fields.get("name") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,24}", nm):
+            self._send(400, "application/json", json.dumps({"ok": False, "error": "bad account name (1-24 chars, letters/digits/dot/_/-)"}))
+            return
+        save_account(src_name, nm, fields)
+        log(f"[config] account saved: {src_name}/{nm} ({source_category(src_name)})")
+        self._send(200, "application/json", json.dumps({"ok": True}))
+
 
     def log_message(self, fmt, *args):   # silence request spam
         pass

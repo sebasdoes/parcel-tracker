@@ -5,7 +5,7 @@ Starts the server as a real child process (Popen), probes the HTTP endpoints,
 then shuts it down. tracker.py --sample serves on :8080 in the foreground.
 Sample data covers both sources (vinted + postnl).
 """
-import json, os, shutil, subprocess, sys, time, urllib.request
+import json, os, shutil, subprocess, sys, time, urllib.request, urllib.error
 
 BASE = "http://127.0.0.1:8080"
 
@@ -86,4 +86,88 @@ for name, ok in checks:
     print(f"PASS: {name}" if ok else f"FAIL: {name}")
 for n in notes:
     print(f"  note: {n}")
-sys.exit(0 if checks and all(ok for _, ok in checks) else 1)
+if not (checks and all(ok for _, ok in checks)):
+    sys.exit(1)
+
+# ---------------- config/account CRUD against a fresh non-sample instance ----------------
+import os as _os
+import shutil as _shutil
+import tempfile as _tempfile
+
+_tmp = _tempfile.mkdtemp(prefix="parcelsmoke-")
+_env = {**_os.environ,
+        "DATA_DIR": _tmp,
+        "DB_PATH": _tmp + "/t.db",
+        "STATEFILE": _tmp + "/s.json",
+        "CONFIG_PATH": _tmp + "/config.json",
+        "WEB_PORT": "8086"}
+BASE2 = "http://127.0.0.1:8086"
+
+
+def get2(path, timeout=8):
+    return urllib.request.urlopen(BASE2 + path, timeout=timeout)
+
+
+def post2(path, body, timeout=8):
+    req = urllib.request.Request(BASE2 + path, method="POST",
+                                 headers={"content-type": "application/json"},
+                                 data=json.dumps(body).encode())
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        return e   # 4xx responses still carry our json error body
+
+
+srv2 = subprocess.Popen([sys.executable, "tracker.py"], env=_env,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def wait_ready2(seconds=15.0):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if srv2.poll() is not None:
+            print("SERVER2 OUTPUT:\n" + (srv2.stdout.read() or ""), flush=True)
+            return False
+        try:
+            if json.loads(get2("/healthz").read().decode()).get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
+cc = {}
+try:
+    if not wait_ready2():
+        cc["config server ready"] = False
+    else:
+        cc["config server ready"] = True
+        cc["config page ok"] = get2("/config").status == 200 and b"cfgbox" in get2("/config").read()
+        r1 = json.loads(post2("/api/accounts", {
+            "op": "save", "source": "vinted",
+            "fields": {"name": "kim", "cookie": "SECRETCOOKIEVALUEabcdef0123456789", "user_agent": "UA"},
+        }).read().decode())
+        cc["account save ok"] = r1.get("ok") is True
+        accs = json.loads(get2("/api/accounts.json").read().decode())
+        blob = json.dumps(accs)
+        cookie_shown = [v.get("fields", {}).get("cookie", "")
+                        for s in accs.get("shop", {}).values() for v in s]
+        cc["secrets masked"] = ("SECRETCOOKIEVALUE" not in blob) and bool(cookie_shown)
+        r2 = json.loads(post2("/api/accounts", {
+            "op": "delete", "source": "vinted", "name": "kim"}).read().decode())
+        accs2 = json.loads(get2("/api/accounts.json").read().decode())
+        cc["account delete ok"] = r2.get("ok") is True and not accs2.get("shop", {}).get("vinted")
+        r3 = json.loads(post2("/api/accounts", {
+            "op": "save", "source": "amazon", "fields": {"name": "x", "cookie": "c"}}).read().decode())
+        cc["planned source rejected"] = r3.get("ok") is False
+finally:
+    srv2.terminate()
+    _shutil.rmtree(_tmp, ignore_errors=True)
+
+fails = [k for k, v in cc.items() if not v]
+for k, v in cc.items():
+    print(("PASS: " if v else "FAIL: ") + k)
+if fails:
+    sys.exit(1)
+print("smoke OK (dashboard + config)")
