@@ -1588,7 +1588,7 @@ def render_transactions(rows, heading, note="", since_label=False):
     if not rows:
         out += f'<p class="muted">{note or "none"}</p>'
         return out
-    fourth = "Since" if since_label else "Until"
+    fourth = "Since" if since_label else "Arrives"
     out += f"<div class='tablewrap'><table><tr><th>Item</th><th>Status</th><th>Where</th><th>{fourth}</th></tr>"
     for t in rows:
         deadline = t.get("deadline") or ""
