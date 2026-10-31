@@ -65,7 +65,8 @@ try:
                            and srcs.count("vinted") == 3
                            and srcs.count("postnl") == 3
                            and srcs.count("bol") == 3
-                           and set(d.get("sources", {})) == {"vinted/main", "postnl/main", "bol/main"}))
+                           and srcs.count("amazon") == 2
+                           and set(d.get("sources", {})) == {"vinted/main", "postnl/main", "bol/main", "amazon/main"}))
         except Exception as e:
             checks.append(("/api/overview.json ok", False))
             notes.append(f"/api/overview.json: {e}")
@@ -159,8 +160,15 @@ try:
         accs2 = json.loads(get2("/api/accounts.json").read().decode())
         cc["account delete ok"] = r2.get("ok") is True and not accs2.get("shop", {}).get("vinted")
         r3 = json.loads(post2("/api/accounts", {
-            "op": "save", "source": "amazon", "fields": {"name": "x", "cookie": "c"}}).read().decode())
-        cc["planned source rejected"] = r3.get("ok") is False
+            "op": "save", "source": "amazon",
+            "fields": {"name": "seb", "cookie": "SECRETCOOKIEVALUEabcdef0123456789"}}).read().decode())
+        cc["amazon account save ok"] = r3.get("ok") is True
+        accs3 = json.loads(get2("/api/accounts.json").read().decode())
+        cc["amazon secrets masked"] = "SECRETCOOKIEVALUE" not in json.dumps(accs3)
+        r4 = json.loads(post2("/api/accounts", {
+            "op": "delete", "source": "amazon", "name": "seb"}).read().decode())
+        accs4 = json.loads(get2("/api/accounts.json").read().decode())
+        cc["amazon account delete ok"] = r4.get("ok") is True and not accs4.get("shop", {}).get("amazon")
 finally:
     srv2.terminate()
     _shutil.rmtree(_tmp, ignore_errors=True)

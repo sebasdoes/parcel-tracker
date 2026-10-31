@@ -1,0 +1,38 @@
+[
+  {
+    "source": "amazon",
+    "account": "main",
+    "order_id": "111-2223333-4445555",
+    "role": "in",
+    "title": "Kindle Paperwhite 16 GB (fixture)",
+    "state": "Arriving tomorrow",
+    "updated_at": null,
+    "pickup": {},
+    "deadline": "2026-11-01T12:00:00",
+    "track": "https://www.amazon.nl/progress-tracker/package?ref=ppx_yo2ov_dt_b_fed_track_package&orderId=111-2223333-4445555&shipmentId=FIXT01&packageIndex=0&vt=NOTIFICATIONS",
+    "raw": {
+      "placed": "29 October 2026",
+      "titles": ["Kindle Paperwhite 16 GB (fixture)"],
+      "statuses": ["Arriving tomorrow"],
+      "total": "€129.99"
+    }
+  },
+  {
+    "source": "amazon",
+    "account": "main",
+    "order_id": "111-8888888-9999000",
+    "role": "in",
+    "title": "USB-C kabel 2 m (fixture) (+2 items)",
+    "state": "Delivered 12 October / Delivered 12 October",
+    "updated_at": "2026-10-12T12:00:00",
+    "pickup": {},
+    "deadline": "2026-11-11T12:00:00",
+    "track": "https://www.amazon.nl/progress-tracker/package?ref=ppx_yo2ov_dt_b_fed_track_package&orderId=111-8888888-9999000&shipmentId=FIXT02&packageIndex=0&vt=NOTIFICATIONS",
+    "raw": {
+      "placed": "4 October 2026",
+      "titles": ["USB-C kabel 2 m (fixture)", "Snellader 65W (fixture)", "Telefoonhoesje (fixture)"],
+      "statuses": ["Delivered 12 October", "Delivered 12 October"],
+      "total": "€24.00"
+    }
+  }
+]

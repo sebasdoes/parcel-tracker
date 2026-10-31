@@ -97,9 +97,11 @@ SOURCE_REGISTRY = {
                   "fields": [("name", "Account name"),
                              ("cookie", "Full Cookie header"),
                              ("user_agent", "User-Agent (optional)")]},
-    "amazon":    {"category": "shop",    "label": "Amazon", "planned": True,
-                  "fields": [("name", "Account name"), ("cookie", "Full Cookie header"),
-                             ("user_agent", "User-Agent (optional)")]},
+    "amazon":    {"category": "shop",    "label": "Amazon",
+                  "fields": [("name", "Account name"),
+                             ("cookie", "Full Cookie header (paste from a logged-in request)"),
+                             ("user_agent", "User-Agent (optional — same browser as the cookie)"),
+                             ("domain", "Domain (optional, e.g. www.amazon.nl)")]},
     "postnl":    {"category": "carrier", "label": "PostNL",
                   "fields": [("name", "Account name"), ("email", "Email"),
                              ("password", "Password")]},
@@ -1186,6 +1188,144 @@ def fetch_bol(acct) -> list:
 
 # ------------------------- postnl source -------------------------
 
+# ------------------------- amazon -------------------------
+# Headless scrape of Amazon's LEGACY no-JS order-history renderer. The modern
+# /your-orders pages CSD-encrypt order data client-side on some fetches (an
+# approach amazon-go documents); `disableCsd=no-js` opts into the legacy
+# renderer, which is plain server-rendered HTML. Session = the user's pasted
+# full Cookie header from a real browser (/config); the poller runs from the
+# home LAN, so no browser runtime and no headless-challenge machinery needed.
+
+_AMAZON_DEFAULT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
+_AMAZON_SLOT_RE = re.compile(r'data-csa-c-slot-id="amzn1\.yourorders\.order-card\.(\d{3}-\d{7}-\d{7})"')
+_AMAZON_STATUS_RE = re.compile(r'yohtmlc-shipment-status-primaryText[^>]*>(?:\s*<[^>]*>)*\s*([^<]{2,120})')
+_AMAZON_TITLE_RE = re.compile(r'yohtmlc-product-title[^>]*>(?:\s*<[^>]*>)*\s*([^<>]{4,300})')
+_AMAZON_TRACK_RE = re.compile(r'href="([^"]*progress-tracker/package[^"]*)"')
+_AMAZON_MONTHS = {"january": 1, "januari": 1, "jan": 1, "february": 2, "februari": 2, "feb": 2,
+                  "march": 3, "maart": 3, "mrt": 3, "april": 4, "apr": 4, "may": 5, "mei": 5,
+                  "june": 6, "juni": 6, "jun": 6, "july": 7, "juli": 7, "jul": 7,
+                  "august": 8, "augustus": 8, "aug": 8, "september": 9, "sept": 9,
+                  "october": 10, "oktober": 10, "okt": 10, "november": 11, "nov": 11,
+                  "december": 12, "dec": 12}
+
+def _amazon_text(chunk):
+    """All visible text inside an HTML chunk, tags discarded."""
+    txt = re.sub(r"<[^>]+>", "\x00", chunk)
+    return " ".join(re.sub(r"\s+", " ", s).strip() for s in txt.split("\x00") if s.strip())
+
+def _amazon_date(shape, month, day):
+    """ISO date with year inferred: Amazon abbreviates dates to no year.
+    future  ('Arriving 2 January' seen in October) -> month below now = next year
+    past    ('Delivered 12 January' seen in October) -> month past now = this year"""
+    year = time.gmtime().tm_year
+    if month < time.gmtime().tm_mon and shape == "future":
+        year += 1
+    if month > time.gmtime().tm_mon and shape == "past":
+        year -= 1
+    return f"{year:04d}-{month:02d}-{int(day):02d}T12:00:00"
+
+def _amazon_deadline(statuses, now=None):
+    """ETA for an in-transit amazon shipment: the order list carries the arrival
+    promise in the shipment status text ('Arriving 4 November', 'Arriving
+    tomorrow'). 'Delivered 28 October' is history, not a deadline — skipped."""
+    for st in statuses:
+        s = (st or "").lower()
+        if "arriv" not in s and "delivery" not in s:
+            continue
+        if "deliver" in s and "arriv" not in s:
+            continue                      # 'Delivered X' is a done shape
+        if "tomorrow" in s:
+            return time.strftime("%Y-%m-%dT12:00:00", time.gmtime((now or time.time()) + 86400))
+        if "today" in s:
+            return time.strftime("%Y-%m-%dT20:00:00", time.gmtime(now or time.time()))
+        dm = re.search(r'\b(\d{1,2})[a-z]{0,2}\s+([a-z]{3,9})', s)
+        if dm and dm.group(2) in _AMAZON_MONTHS:
+            return _amazon_date("future", _AMAZON_MONTHS[dm.group(2)], dm.group(1))
+    return None
+
+def _amazon_past_date(st):
+    """updated_at for a completed amazon state text ('Delivered 28 October')."""
+    dm = re.search(r'\b(\d{1,2})\s+([a-z]{3,9})\b', (st or "").lower())
+    if dm and dm.group(2) in _AMAZON_MONTHS:
+        return _amazon_date("past", _AMAZON_MONTHS[dm.group(2)], dm.group(1))
+    return None
+
+def _amazon_get(url, ua, cookie_raw):
+    req = urllib.request.Request(url, headers={
+        "user-agent": ua, "cookie": cookie_raw,
+        "accept-language": "en-GB,en;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode("utf-8", "replace")
+            final = r.geturl()
+    except HTTPError as e:
+        detail = (e.read() or b"")[:180].decode("utf-8", "replace")
+        raise RuntimeError(f"amazon http {e.code}: {detail!r}") from None
+    if "/ap/signin" in final:
+        raise ValueError("amazon session expired (redirected to sign-in) — paste a fresh cookie in /config")
+    if "captcha" in body[:120000].lower() or "Enter the characters" in body:
+        raise RuntimeError("amazon bot challenge — retry later; if it repeats, refresh cookies in /config")
+    return body
+
+def parse_amazon_orders(html, account="main", domain="www.amazon.nl") -> list:
+    """One row per order card on the legacy no-JS order-history page.
+
+    Multi-shipment orders (order split into packages) keep one row per order
+    id; per-shipment status texts join with ' / ' and the track link is the
+    first shipment's."""
+    from html import unescape
+    hits = list(_AMAZON_SLOT_RE.finditer(html))
+    out = []
+    for i, m in enumerate(hits):
+        card = html[m.start(): hits[i + 1].start() if i + 1 < len(hits) else len(html)]
+        card = re.sub(r"<script.*?</script>", " ", card, flags=re.S)
+        oid = m.group(1)
+        statuses = [unescape(k.group(1)).strip() for k in _AMAZON_STATUS_RE.finditer(card)]
+        statuses = [s for s in statuses if s]
+        titles = [unescape(k.group(1)).strip() for k in _AMAZON_TITLE_RE.finditer(card)]
+        titles = [re.sub(r"\s+", " ", t) for t in titles if t]
+        tm = _AMAZON_TRACK_RE.search(card)
+        href = unescape(tm.group(1)) if tm else None
+        track = None
+        if href:
+            track = href if href.startswith("http") else ("https://" + domain + ("" if href.startswith("/") else "/") + href)
+        head = _amazon_text(card[:3000]).lower()
+        pm = re.search(r'order placed\s*(\d{1,2}\s+[a-z]{3,9}(?:\s+\d{4})?)', head)
+        placed = pm.group(1) if pm else ""
+        gm = re.search(r'total\s*(€\s?\d+[.,]\d{2})', head)
+        total = gm.group(1).replace(" ", "") if gm else ""
+        state = " / ".join(statuses) if statuses else ""
+        deadline = _amazon_deadline(statuses)
+        if statuses and "delivered" in statuses[0].lower():
+            updated = _amazon_past_date(statuses[0])
+        else:
+            updated = None
+        title = ""
+        if titles:
+            title = titles[0] + (f" (+{len(titles)-1} item{'s' if len(titles) > 2 else ''})"
+                                 if len(titles) > 1 else "")
+        out.append({"source": "amazon", "account": account, "order_id": oid, "role": "in",
+                    "title": title or oid, "state": state or "ordered",
+                    "updated_at": updated, "pickup": {}, "deadline": deadline,
+                    "track": track,
+                    "raw": {"placed": placed, "titles": titles, "statuses": statuses,
+                            "total": total, "order_page": f"https://{domain}/gp/your-orders/order-details?orderID={oid}"}})
+    return out
+
+def fetch_amazon(acct) -> list:
+    cookie_raw = acct_cookie(acct)
+    if not cookie_raw:
+        raise ValueError("amazon account needs a Cookie header — paste it from a logged-in browser request in /config")
+    ua = (acct.get("user_agent") or "").strip() or _AMAZON_DEFAULT_UA
+    domain = (acct.get("domain") or "www.amazon.nl").strip().replace("https://", "").replace("http://", "").strip("/")
+    domain = domain.rstrip("/") or "www.amazon.nl"
+    html = _amazon_get(f"https://{domain}/gp/css/order-history?disableCsd=no-js&timeFilter=months-3",
+                       ua, cookie_raw)
+    rows = parse_amazon_orders(html, account=(acct.get("name") or "main"), domain=domain)
+    if not rows:
+        raise ValueError("amazon order-history page held 0 order cards — shape changed or session half-dead; paste a fresh cookie in /config")
+    return rows
+
 def postnl_token_path(account):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", account or "main")
     return os.path.join(DATA_DIR, f"postnl_token_{safe}.json")
@@ -1254,6 +1394,9 @@ def active_sources():
     for acct in acct_list("bol"):
         name = acct.get("name") or "main"
         out.append(("bol", name, lambda a=acct: fetch_bol(a), f"bol/{name}"))
+    for acct in acct_list("amazon"):
+        name = acct.get("name") or "main"
+        out.append(("amazon", name, lambda a=acct: fetch_amazon(a), f"amazon/{name}"))
     return out
 
 def poll_once():
@@ -1484,10 +1627,14 @@ if (_fbar) {
 def p_class(state):
     s = (state or "").lower()
     if "wordt" in s and "bezorgd" in s: return "transit"   # 'Wordt (vandaag) bezorgd' = underway
-    if any(x in s for x in ("bezorgd", "afgeleverd", "ontvangen", "complete")): return "done"
-    if ("pick" in s and ("up" in s or "ready" in s)) or "klaar" in s or "punt" in s: return "wait"
-    if any(x in s for x in ("received", "picked", "success")): return "done"
+    if "out for delivery" in s or "delivering" in s: return "transit"
     if any(x in s for x in ("transit", "shipped", "sending", "onderweg")): return "transit"
+    if "arriv" in s: return "transit"                      # arriving/arrives = on the way
+    if any(x in s for x in ("bezorgd", "afgeleverd", "ontvangen", "complete", "deliver")): return "done"
+    if (s.startswith(("cancel", "return", "refund")) or "canceled" in s or "cancelled" in s
+            or "refund" in s): return "other"
+    if (s and ("pick" in s and ("up" in s or "ready" in s))) or "klaar" in s or "punt" in s: return "wait"
+    if any(x in s for x in ("received", "picked", "success")): return "done"
     return "other"
 
 def is_waiting(state, role):
@@ -2027,9 +2174,15 @@ def seed_sample():
     for t in bol_tx:
         t["account"] = t.get("account") or "main"
     parsed.extend(bol_tx)
+    apath = os.path.join(os.path.dirname(__file__) or ".", "sample", "amazon.json")
+    amazon_tx = json.load(open(apath))
+    for t in amazon_tx:
+        t["account"] = t.get("account") or "main"
+    parsed.extend(amazon_tx)
     sources_state = {"vinted/main": {"ok": True, "count": len(vinted)},
                      "postnl/main": {"ok": True, "count": len(postnl_tx)},
-                     "bol/main": {"ok": True, "count": len(bol_tx)}}
+                     "bol/main": {"ok": True, "count": len(bol_tx)},
+                     "amazon/main": {"ok": True, "count": len(amazon_tx)}}
     seen = time.time()
     with db() as con:
         for t in parsed:
