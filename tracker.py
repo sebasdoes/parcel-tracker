@@ -621,6 +621,7 @@ def vinted_csrf(base, ua, cookie_raw, name):
 
 VINTED_META: dict[str, dict] = {}
 _rotation_log_at: dict[str, float] = {}
+_notify_seen: dict[str, str] = {}   # per-source up/down state for one-shot failure notifies
 
 CLIENT_CANDIDATES = ("web", "ios", "android", "bff", "spa", "app", "vinted", "public")
 
@@ -1412,9 +1413,17 @@ def poll_once():
             txs = fetch()
             sources_state[key] = {"ok": True, "count": len(txs),
                                   **VINTED_META.get(account, {})}
+            if _notify_seen.get(key) == "down":
+                _notify_seen.pop(key, None)
+                post_webhook({"source": "parcel-tracker", "kind": "source-up",
+                              "detail": f"{key} polls again ({len(txs)} rows)", "ts": seen})
         except postnl_mod.InvalidCredentials as e:
             sources_state[key] = {"ok": False, "error": "bad_credentials", "detail": str(e)[:120]}
             log("PostNL rejected credentials — ACTION: fix the account's email/password in config.json")
+            if _notify_seen.get(key) != "down":
+                _notify_seen[key] = "down"
+                post_webhook({"source": "parcel-tracker", "kind": "source-down",
+                              "detail": f"{key} poll failed: bad_credentials", "ts": seen})
             continue
         except Exception as e:
             sources_state[key] = {"ok": False,
@@ -1422,6 +1431,10 @@ def poll_once():
             log(f"source {key} failed: {sources_state[key]['error']}")
             if "datadome" in str(type(e).__name__) + str(e):
                 log("ACTION: copy fresh cookies (session + datadome) into the account's cookies file")
+            if _notify_seen.get(key) != "down":
+                _notify_seen[key] = "down"
+                post_webhook({"source": "parcel-tracker", "kind": "source-down",
+                              "detail": f"{key} poll failed: {sources_state[key]['error']}", "ts": seen})
             continue
         with db() as c:
             for t in txs:
