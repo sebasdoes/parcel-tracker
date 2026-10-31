@@ -31,7 +31,7 @@ jobs:
           docker run -d --rm --name vt-serve -e SAMPLE=1 -p 8080:8080 vinted-tracker:test
           sleep 5
           curl -sf http://127.0.0.1:8080/healthz | grep -q '"ok": true'
-          curl -sf http://127.0.0.1:8080/api/overview.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert {t["source"] for t in d["transactions"]} == {"vinted","postnl","bol"}, "expected all three sources"; assert set(d["sources"]) == {"vinted/main","postnl/main","bol/main"}, "expected account-keyed source health"'
+          curl -sf http://127.0.0.1:8080/api/overview.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert {t["source"] for t in d["transactions"]} == {"vinted","postnl","bol","amazon"}, "expected all four sources"; assert set(d["sources"]) == {"vinted/main","postnl/main","bol/main","amazon/main"}, "expected account-keyed source health"'
           curl -sf http://127.0.0.1:8080/ | grep -q "Awaiting pick-up"
           docker stop vt-serve
 
